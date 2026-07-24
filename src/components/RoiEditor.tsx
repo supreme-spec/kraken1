@@ -134,10 +134,6 @@ export default function RoiEditor({ cameraId, cameraName, onClose }: Props) {
     ctx.clearRect(0, 0, canvasW, canvasH)
     ctx.drawImage(bgImage, 0, 0, canvasW, canvasH)
 
-    // Dim overlay
-    ctx.fillStyle = 'rgba(0,0,0,0.35)'
-    ctx.fillRect(0, 0, canvasW, canvasH)
-
     // Draw saved zones
     zones.forEach((z, i) => {
       const cx = z.x1 * scaleX

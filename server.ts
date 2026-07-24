@@ -478,74 +478,44 @@ function downscaleSnapshot(filePath: string, maxWidth: number, maxHeight: number
 
 app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/api/cameras/unv/webhook", "/api/cameras/unv/webhook/"], upload.any(), async (req, res) => {
   logDebug("UNV LAPI Webhook received", { headers: req.headers['content-type'], query: req.query, bodyKeys: Object.keys(req.body) });
-  
+
+  const sendUnvSuccess = () => {
+    res.setHeader("Content-Type", "application/json");
+    res.status(200).json({ ResponseCode: 0, ResponseString: "Succeed" });
+  };
+
   let cameraId = parseInt(req.query.camera_id as string || req.query.id as string || "");
   let camera = cameras.find(c => c.id === cameraId);
-  
+
   if (!camera) {
-    // Fallback: match by IP address
     const incomingIp = req.ip || req.socket.remoteAddress || "";
     logDebug("Attempting to find UNV camera by IP", { incomingIp });
-    camera = cameras.find(c => 
-      c.camera_type === "UNV" && 
-      c.ip_address && 
+    camera = cameras.find(c =>
+      c.camera_type === "UNV" &&
+      c.ip_address &&
       (incomingIp.includes(c.ip_address) || c.ip_address.includes(incomingIp))
     );
   }
-  
+
   if (!camera) {
     camera = cameras.find(c => c.camera_type === "UNV") || cameras[0];
   }
 
   if (!camera) {
-    return res.status(404).json({ error: "No cameras configured to receive UNV notification" });
+    logWarn("UNV Webhook: Камера не найдена, но возвращаем успех для предотвращения спама");
+    return sendUnvSuccess();
   }
 
   logInfo(`UNV webhook → camera ID ${camera.id} (${camera.name})`);
 
-  // Parse JSON data from any fields or body
-  let parsedPayload: any = null;
-  
-  if (req.body && Object.keys(req.body).length > 0) {
-    parsedPayload = req.body;
-  }
-  
-  for (const key of Object.keys(req.body)) {
-    const val = req.body[key];
-    if (typeof val === 'string' && (val.trim().startsWith('{') || val.trim().startsWith('['))) {
-      try {
-        parsedPayload = JSON.parse(val);
-        logDebug(`Parsed JSON from form field "${key}"`);
-        break;
-      } catch (err) {
-        // ignore
-      }
-    }
-  }
+  let snapshot_path = "snapshots/ev1.jpg";
+  let imageBuffer: Buffer | null = null;
+  const filesList = (req.files || []) as Express.Multer.File[];
 
-  let personName: string | undefined;
-  let confidence: number | undefined;
-
-  if (parsedPayload) {
-    const extracted = findNameAndSimilarity(parsedPayload);
-    personName = extracted.name;
-    confidence = extracted.similarity;
-  }
-
-  logDebug(`UNV extracted name: "${personName}", similarity: ${confidence}`);
-
-  // Helper for smart capture naming according to user request format (ДДММГГГГ_ЧЧММСС_Неизвестный)
-  const getSmartCaptureFilename = (pName?: string, ext = ".jpg") => {
+  const getSmartFilename = (pName?: string, ext = ".jpg") => {
     const now = new Date();
-    const day = String(now.getDate()).padStart(2, '0');
-    const month = String(now.getMonth() + 1).padStart(2, '0');
-    const year = now.getFullYear();
-    const hours = String(now.getHours()).padStart(2, '0');
-    const minutes = String(now.getMinutes()).padStart(2, '0');
-    const seconds = String(now.getSeconds()).padStart(2, '0');
-    const dateStr = `${day}${month}${year}`;
-    const timeStr = `${hours}${minutes}${seconds}`;
-
+    const dateStr = `${String(now.getDate()).padStart(2, '0')}${String(now.getMonth() + 1).padStart(2, '0')}${now.getFullYear()}`;
+    const timeStr = `${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`;
     const isUnknown = !pName || pName.toLowerCase() === 'unknown' || pName.toLowerCase() === 'неизвестный' || pName.toLowerCase() === 'неизвестный клиент';
     if (isUnknown) {
       return `${dateStr}_${timeStr}_Неизвестный${ext}`;
@@ -554,86 +524,93 @@ app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/a
     }
   };
 
-  // Save the uploaded snapshot file if present
-  let snapshot_path = "snapshots/ev1.jpg";
-  const filesList = (req.files || []) as Express.Multer.File[];
-  
   if (filesList.length > 0) {
     const file = filesList[0];
-    const targetFilename = getSmartCaptureFilename(personName, path.extname(file.originalname) || '.jpg');
+    const targetFilename = getSmartFilename(path.extname(file.originalname) || '.jpg');
     const targetPath = path.join(snapshotsDir, targetFilename);
     try {
       fs.copyFileSync(file.path, targetPath);
       snapshot_path = `snapshots/${targetFilename}`;
       logInfo(`UNV snapshot saved: ${snapshot_path}`);
       await downscaleSnapshot(targetPath, UNV_MAX_SNAPSHOT_WIDTH, UNV_MAX_SNAPSHOT_HEIGHT);
+      imageBuffer = await fs.promises.readFile(targetPath);
     } catch (err) {
       logError(err as Error, { context: "UNV snapshot copy" });
     }
   } else {
-    let base64Image: string | null = null;
     for (const key of Object.keys(req.body)) {
       const val = req.body[key];
-      if (typeof val === 'string' && (val.startsWith('data:image') || val.length > 1000 && /^[A-Za-z0-9+/=]+$/.test(val.slice(0, 100)))) {
-        base64Image = val;
-        break;
-      }
-    }
-    if (base64Image) {
-      try {
-        const base64Data = base64Image.includes('base64,') ? base64Image.split('base64,')[1] : base64Image;
-        const targetFilename = getSmartCaptureFilename(personName, ".jpg");
-        const targetPath = path.join(snapshotsDir, targetFilename);
-        fs.writeFileSync(targetPath, Buffer.from(base64Data, 'base64'));
-        snapshot_path = `snapshots/${targetFilename}`;
-        logInfo(`UNV base64 snapshot saved: ${snapshot_path}`);
-        await downscaleSnapshot(targetPath, UNV_MAX_SNAPSHOT_WIDTH, UNV_MAX_SNAPSHOT_HEIGHT);
-      } catch (err) {
-        logError(err as Error, { context: "UNV base64 snapshot" });
+      if (typeof val === 'string' && (val.startsWith('data:image') || val.length > 1000)) {
+        try {
+          const base64Data = val.includes('base64,') ? val.split('base64,')[1] : val;
+          const targetFilename = getSmartFilename(".jpg");
+          const targetPath = path.join(snapshotsDir, targetFilename);
+          imageBuffer = Buffer.from(base64Data, 'base64');
+          await fs.promises.writeFile(targetPath, imageBuffer);
+          snapshot_path = `snapshots/${targetFilename}`;
+          await downscaleSnapshot(targetPath, UNV_MAX_SNAPSHOT_WIDTH, UNV_MAX_SNAPSHOT_HEIGHT);
+          break;
+        } catch (err) {
+          logError(err as Error, { context: "UNV base64 snapshot" });
+        }
       }
     }
   }
 
-  // Async: lookup person in DB and persist event
+  let matchedPerson: any = null;
+  let confidence = 0;
+  let eventType = "UNKNOWN";
+
+  if (imageBuffer) {
+    try {
+      const tempPath = path.join(snapshotsDir, `unv_temp_${Date.now()}.jpg`);
+      await fs.promises.writeFile(tempPath, imageBuffer);
+      const threshold = recognition_threshold_pct / 100;
+      const matches = await searchByPhoto(tempPath, threshold, 1);
+      if (matches && matches.length > 0) {
+        const bestMatch = matches[0];
+        confidence = bestMatch.similarity;
+        matchedPerson = await prisma.person.findUnique({
+          where: { id: bestMatch.personId },
+          include: { photos: true }
+        });
+        if (matchedPerson) {
+          eventType = matchedPerson.category === "BLACKLIST" ? "BLACKLIST_ALERT" :
+                     matchedPerson.category === "VIP" ? "VIP_ARRIVAL" :
+                     matchedPerson.category === "RESPONSE" ? "RESPONSE_ALERT" : "RECOGNIZED";
+        }
+      }
+    } catch (err) {
+      logError(err as Error, { context: "UNV face recognition" });
+    }
+  }
+
   (async () => {
     try {
-      let matchedPerson: any = null;
-      if (personName && personName.toLowerCase() !== "unknown" && personName.toLowerCase() !== "неизвестный") {
-        const allPersons = await prisma.person.findMany({ select: { id: true, name: true, category: true, photo_path: true, visit_count: true } });
-        matchedPerson = allPersons.find((p: any) => p.name.toLowerCase() === personName!.toLowerCase());
-      }
-
       if (matchedPerson) {
         await prisma.person.update({
           where: { id: matchedPerson.id },
-          data: { visit_count: { increment: 1 }, last_seen_at: new Date() },
+          data: { visit_count: { increment: 1 }, last_seen_at: new Date() }
         });
-        // Sync in-memory
         const idx = persons.findIndex((p) => p.id === matchedPerson.id);
         if (idx >= 0) { persons[idx].visit_count++; persons[idx].last_seen_at = new Date().toISOString(); }
 
-        let event_type = "RECOGNIZED";
-        if (matchedPerson.category === "VIP") event_type = "VIP_ARRIVAL";
-        else if (matchedPerson.category === "BLACKLIST") event_type = "BLACKLIST_ALERT";
-        else if (matchedPerson.category === "RESPONSE") event_type = "RESPONSE_ALERT";
-
-        const eventConfidence = confidence || 0.85;
-        const meetsVerification = (eventConfidence * 100) >= verification_threshold_pct;
+        const meetsVerification = (confidence * 100) >= verification_threshold_pct;
 
         await prisma.event.create({
           data: {
             camera_id: camera.id,
             camera_name: camera.name,
             person_id: matchedPerson.id,
-            event_type,
-            confidence: eventConfidence,
+            event_type: eventType,
+            confidence,
             snapshot_path,
             person_name: matchedPerson.name,
             person_category: matchedPerson.category,
-            person_photo_path: matchedPerson.photo_path,
+            person_photo_path: matchedPerson.photos[0]?.photo_path || null,
             needs_operator_confirmation: !meetsVerification,
             confirmation_status: !meetsVerification ? "pending" : null,
-          },
+          }
         });
 
         broadcastSecurity({
@@ -642,7 +619,7 @@ app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/a
           person_id: matchedPerson.id,
           person_name: matchedPerson.name,
           camera_id: camera.id,
-          confidence: eventConfidence,
+          confidence,
           snapshot_path,
           timestamp: new Date().toISOString(),
         });
@@ -655,14 +632,14 @@ app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/a
             event_type: "UNKNOWN",
             confidence: confidence || 0.5,
             snapshot_path,
-            person_name: personName || "Неизвестный",
+            person_name: "Неизвестный",
             person_category: "CLIENT",
-          },
+          }
         });
         broadcastSecurity({
           type: "ALERT",
           category: "CLIENT",
-          person_name: personName || "Неизвестный",
+          person_name: "Неизвестный",
           camera_id: camera.id,
           confidence: confidence || 0.5,
           snapshot_path,
@@ -675,7 +652,7 @@ app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/a
     }
   })();
 
-  res.json({ success: true, camera_id: camera.id, processed: true });
+  sendUnvSuccess();
 });
 
 app.post(
@@ -1088,33 +1065,128 @@ app.post(["/api/setup/metal-detector", "/api/setup/metal-detector/"], async (req
 app.delete(["/api/cameras/:id", "/api/cameras/:id/"], async (req, res) => {
   try {
     const id = parseInt(req.params.id);
+    const cam = cameras.find((c) => c.id === id);
+
+    if (!cam) {
+      return res.status(404).json({ detail: "Camera not found" });
+    }
+
+    const cleanup: string[] = [];
+
+    // 1. Останавливаем FFmpeg, таймеры и ретраи
+    stopCameraPipeline(id);
+
+    // 2. Закрываем активные WebSocket-потоки камеры
+    const streams = cameraStreams.get(id);
+    if (streams) {
+      for (const ws of streams) {
+        try { ws.close(); } catch {}
+      }
+      cameraStreams.delete(id);
+      cleanup.push(`WebSocket-потоки закрыты`);
+    }
+
+    // 3. Удаляем файлы снапшотов событий этой камеры
+    const events = await prisma.event.findMany({
+      where: { camera_id: id },
+      select: { snapshot_path: true },
+    });
+    let deletedFiles = 0;
+    for (const ev of events) {
+      if (!ev.snapshot_path) continue;
+      const fullPath = path.join(publicDir, ev.snapshot_path);
+      if (fs.existsSync(fullPath)) {
+        try { fs.unlinkSync(fullPath); deletedFiles++; }
+        catch (err) { logWarn(`Не удалось удалить снапшот ${fullPath}: ${err}`); }
+      }
+    }
+    if (deletedFiles > 0) cleanup.push(`Снапшот-файлов удалено: ${deletedFiles}`);
+
+    // 4. Удаляем временные файлы камеры
+    const tempPrefix = `temp_snap_${id}_`;
+    const tempFile = path.join(snapshotsDir, `temp_snap_${id}.jpg`);
+    const tempFiles = (fs.existsSync(snapshotsDir) ? fs.readdirSync(snapshotsDir) : [])
+      .filter((f) => f === `temp_snap_${id}.jpg` || f.startsWith(tempPrefix));
+    for (const f of tempFiles) {
+      try { fs.unlinkSync(path.join(snapshotsDir, f)); } catch {}
+    }
+    if (tempFiles.length > 0) cleanup.push(`Временных файлов удалено: ${tempFiles.length}`);
+
+    // 5. Каскадное удаление из БД (Event и Recording удалятся via onDelete: Cascade)
     await prisma.camera.delete({ where: { id } });
+
+    // 6. Удаление из оперативной памяти
     cameras = cameras.filter((c) => c.id !== id);
-    res.json({ success: true });
+
+    logInfo(`Камера ${cam.name} (${id}) полностью удалена`, { cleanup });
+    broadcastSecurity({ type: "CAMERA_DELETED", camera_id: id, camera_name: cam.name });
+
+    res.json({ success: true, message: "Камера удалена", cleanup });
   } catch (err) {
     logError(err as Error, { path: "/api/cameras/:id", method: "DELETE" });
     res.status(404).json({ detail: "Camera not found" });
   }
 });
 
-app.get("/api/cameras/:id/snapshot", (req, res) => {
-  const id = parseInt(req.params.id);
-  let imageBuffer: Buffer;
-  const rusSrc = path.join(process.cwd(), "src", "assets", "rus.jpg");
-  const logoSrc = path.join(process.cwd(), "src", "assets", "logo.jpg");
+app.get("/api/cameras/:id/snapshot", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const cam = cameras.find((c) => c.id === id);
+    let imageBuffer: Buffer | null = null;
 
-  if (fs.existsSync(rusSrc)) {
-    imageBuffer = fs.readFileSync(rusSrc);
-  } else if (fs.existsSync(logoSrc)) {
-    imageBuffer = fs.readFileSync(logoSrc);
-  } else {
-    imageBuffer = Buffer.from(FALLBACK_JPEG, "base64");
+    if (cam && cam.is_active && cam.source && !cam.source.startsWith("/dev/video")) {
+      const tempSnapPath = path.join(snapshotsDir, `temp_snap_${id}.jpg`);
+      try {
+        const ffmpegPath = getFfmpegPath();
+        await execAsync(`"${ffmpegPath}" -y -rtsp_transport tcp -i "${cam.source}" -vframes 1 -q:v 2 "${tempSnapPath}"`, { timeout: 5000 });
+        if (fs.existsSync(tempSnapPath)) {
+          imageBuffer = await fs.promises.readFile(tempSnapPath);
+          fs.unlinkSync(tempSnapPath);
+        }
+      } catch (ffmpegErr) {
+        logWarn(`Не удалось сделать живой снимок камеры ${id}: ${ffmpegErr}`);
+      }
+    }
+
+    if (!imageBuffer) {
+      const snapshotsDirPath = path.join(publicDir, "snapshots");
+      const matches: string[] = [];
+      if (fs.existsSync(snapshotsDirPath)) {
+        for (const entry of fs.readdirSync(snapshotsDirPath)) {
+          if (entry.startsWith(`cam${id}_`) && entry.endsWith(".jpg")) {
+            matches.push(path.join(snapshotsDirPath, entry));
+          }
+        }
+      }
+      if (matches.length > 0) {
+        matches.sort().reverse();
+        const latest = matches[0];
+        if (fs.existsSync(latest)) {
+          imageBuffer = fs.readFileSync(latest);
+        }
+      }
+    }
+
+    if (!imageBuffer) {
+      const rusSrc = path.join(process.cwd(), "src", "assets", "rus.jpg");
+      const logoSrc = path.join(process.cwd(), "src", "assets", "logo.jpg");
+      if (fs.existsSync(rusSrc)) {
+        imageBuffer = fs.readFileSync(rusSrc);
+      } else if (fs.existsSync(logoSrc)) {
+        imageBuffer = fs.readFileSync(logoSrc);
+      } else {
+        imageBuffer = Buffer.from(FALLBACK_JPEG, "base64");
+      }
+    }
+
+    res.json({
+      image: imageBuffer.toString("base64"),
+      content_type: "image/jpeg",
+    });
+  } catch (err) {
+    logError(err as Error, { path: "/api/cameras/:id/snapshot" });
+    res.status(500).json({ detail: "Не удалось получить снимок" });
   }
-
-  res.json({
-    image: imageBuffer.toString("base64"),
-    content_type: "image/jpeg",
-  });
 });
 
 app.post("/api/cameras/:id/capture", (req, res) => {
@@ -3990,7 +4062,7 @@ app.post(["/api/backup", "/api/backup/"], async (req, res) => {
 
     // Создаём ZIP архив с БД и медиафайлами
     const output = fs.createWriteStream(backupPath);
-    const archive = new archiverLib.ZipArchive({ zlib: { level: 6 } });
+    const archive = new (archiverLib as any).ZipArchive({ zlib: { level: 6 } });
 
     await new Promise<void>((resolve, reject) => {
       output.on("close", resolve);
@@ -4458,6 +4530,56 @@ async function start() {
   server.listen(PORT, HOST, () => {
     logInfo(`Server running on http://${HOST}:${PORT}`);
   });
+
+  // Camera health check
+  const cameraHealthStatus = new Map<number, boolean>();
+  const resolveCameraIp = (cam: any): string | null => cam.ip_address || (() => {
+    try {
+      const u = new URL(cam.source || "");
+      return u.hostname || null;
+    } catch {
+      return null;
+    }
+  })();
+
+  setInterval(async () => {
+    const activeCameras = cameras.filter(c => c.is_active);
+    for (const cam of activeCameras) {
+      const ipAddress = resolveCameraIp(cam);
+      if (!ipAddress) continue;
+
+      let isOnline = false;
+      try {
+        const { stdout } = await execAsync(`ping -n 1 -w 2000 ${ipAddress}`);
+        isOnline = !stdout.includes('100% packet loss');
+      } catch {
+        isOnline = false;
+      }
+
+      const prev = cameraHealthStatus.get(cam.id);
+      if (prev !== isOnline) {
+        cameraHealthStatus.set(cam.id, isOnline);
+        try {
+          await prisma.camera.update({
+            where: { id: cam.id },
+            data: { status: isOnline ? 'online' : 'offline' }
+          });
+          const idx = cameras.findIndex(c => c.id === cam.id);
+          if (idx >= 0) cameras[idx].status = isOnline ? 'online' : 'offline';
+          logInfo(`Камера ${cam.name} (${ipAddress}) ${isOnline ? 'онлайн' : 'офлайн'}`);
+          broadcastSecurity({
+            type: 'CAMERA_STATUS',
+            camera_id: cam.id,
+            camera_name: cam.name,
+            status: isOnline ? 'online' : 'offline',
+            timestamp: new Date().toISOString()
+          });
+        } catch (err) {
+          logError(err as Error, { context: 'camera health check update', cameraId: cam.id });
+        }
+      }
+    }
+  }, 60000);
 }
 
 start();

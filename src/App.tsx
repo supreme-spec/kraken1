@@ -60,9 +60,13 @@ export default function App() {
   const currentConfirmation = confirmationQueue[0] ?? null
   const [latestFace, setLatestFace] = useState<FaceDetection | null>(null)
   const [showProjection, setShowProjection] = useState(false)
-  const [notifyEnabled, setNotifyEnabled] = useState(() =>
-    localStorage.getItem('kraken_notify') !== 'false'
-  )
+  const [notifyEnabled, setNotifyEnabled] = useState(() => {
+    try {
+      return localStorage.getItem('kraken_notify') !== 'false'
+    } catch {
+      return true
+    }
+  })
   const [enabledCategories, setEnabledCategories] = useState<Set<string>>(() => {
     try {
       const raw = localStorage.getItem('kraken_notify_cats')
