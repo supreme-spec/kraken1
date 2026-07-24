@@ -372,8 +372,10 @@ export default function LiveMonitor({
   useEffect(() => { onLatestFaceRef.current = onLatestFace }, [onLatestFace])
   const [detectedFace, setDetectedFace] = useState<FaceDetection | null>(null)
   const [detectedPerson, setDetectedPerson] = useState<Person | null>(null)
+  const [lastFaceTimestamp, setLastFaceTimestamp] = useState<number>(Date.now())
 
   const handleFaceDetected = useCallback((face: FaceDetection) => {
+    setLastFaceTimestamp(Date.now())
     if (face.track_id === -1) {
       onLatestFaceRef.current?.(null)
       setDetectedFace(null); setDetectedPerson(null)
@@ -398,6 +400,7 @@ export default function LiveMonitor({
   const [search, setSearch] = useState('')
   const [loadingPeople, setLoadingPeople] = useState(false)
   const [showAddModal, setShowAddModal] = useState(false)
+  const [guestInitialPhotos, setGuestInitialPhotos] = useState<File[]>([])
   const [editPerson, setEditPerson] = useState<Person | null>(null)
 
   const fetchPeople = useCallback(async () => {
@@ -429,6 +432,24 @@ export default function LiveMonitor({
         }
       }
     })
+  }
+
+  const handleQuickAddGuest = async () => {
+    if (!selectedCameraId) return
+    setAddError('')
+    try {
+      const snap = await apiFetch<{ image: string; content_type: string }>(
+        `/cameras/${selectedCameraId}/snapshot`
+      )
+      const byteStr = atob(snap.image)
+      const arr = new Uint8Array(byteStr.length)
+      for (let i = 0; i < byteStr.length; i++) arr[i] = byteStr.charCodeAt(i)
+      const file = new File([arr], `guest_${Date.now()}.jpg`, { type: 'image/jpeg' })
+      setGuestInitialPhotos([file])
+      setShowAddModal(true)
+    } catch (e: any) {
+      setAddError(e?.message || 'Не удалось получить снимок')
+    }
   }
 
   const handleAddPhotoFromCamera = async (personId: number, cameraId: number) => {
@@ -790,6 +811,9 @@ export default function LiveMonitor({
               person={detectedPerson}
               confidence={detectedFace?.confidence}
               cameraName={cameras.find(c => c.id === selectedCameraId)?.name}
+              cameraId={selectedCameraId}
+              lastUpdatedAt={lastFaceTimestamp}
+              onAddGuest={handleQuickAddGuest}
             />
           </DraggableBlock>
         )}
@@ -799,8 +823,9 @@ export default function LiveMonitor({
       {showAddModal && (
         <QuickPersonModal
           person={editPerson}
-          onClose={() => { setShowAddModal(false); setEditPerson(null) }}
-          onSaved={() => { setShowAddModal(false); setEditPerson(null); fetchPeople() }}
+          onClose={() => { setShowAddModal(false); setEditPerson(null); setGuestInitialPhotos([]) }}
+          onSaved={() => { setShowAddModal(false); setEditPerson(null); setGuestInitialPhotos([]); fetchPeople() }}
+          initialPhotos={guestInitialPhotos}
         />
       )}
       {showRoi && selectedCamera && (
@@ -836,13 +861,19 @@ export default function LiveMonitor({
 
 // ── LastGuestBlock ────────────────────────────────────────────────────────────
 
-function LastGuestBlock({ person, confidence, cameraName }: {
+function LastGuestBlock({ person, confidence, cameraName, cameraId, lastUpdatedAt, onAddGuest }: {
   person: Person | null
   confidence?: number
   cameraName?: string
+  cameraId?: number
+  lastUpdatedAt?: number
+  onAddGuest?: () => void
 }) {
   const [loyalty, setLoyalty] = useState<any>(null)
   const [personDetails, setPersonDetails] = useState<Person | null>(null)
+  const [showAddModal, setShowAddModal] = useState(false)
+  const [adding, setAdding] = useState(false)
+  const [addError, setAddError] = useState('')
 
   useEffect(() => {
     if (!person?.id) { setLoyalty(null); setPersonDetails(null); return }
@@ -858,11 +889,30 @@ function LastGuestBlock({ person, confidence, cameraName }: {
   const lastVisit = personDetails?.last_seen_at ?? null
   const visitCount = personDetails?.visit_count ?? person?.visit_count ?? 0
 
-  if (!person) {
+  const isStale = lastUpdatedAt ? Date.now() - lastUpdatedAt > 3 * 60_000 : false
+
+  if (!person || isStale) {
     return (
       <div className="h-full flex flex-col items-center justify-center gap-2 text-kraken-disabled p-4">
         <div className="text-4xl opacity-20">👤</div>
         <div className="text-xs text-center">Ожидание распознавания...</div>
+        {!person && cameraId && (
+          <button
+            onClick={async () => {
+              setAddError('')
+              if (onAddGuest) {
+                onAddGuest()
+              } else {
+                setShowAddModal(true)
+              }
+            }}
+            disabled={adding}
+            className="mt-2 text-xs px-3 py-1.5 rounded-lg bg-kraken-purple/20 text-kraken-purple hover:bg-kraken-purple/30 transition-colors disabled:opacity-50"
+          >
+            ＋ Добавить в базу
+          </button>
+        )}
+        {addError && <div className="text-kraken-red text-[10px]">{addError}</div>}
       </div>
     )
   }
@@ -969,7 +1019,7 @@ function LastGuestBlock({ person, confidence, cameraName }: {
 
 // ── Person Modal — мультифото + камера ───────────────────────────────────────
 
-interface ModalProps { person: Person | null; onClose: () => void; onSaved: () => void }
+interface ModalProps { person: Person | null; onClose: () => void; onSaved: () => void; initialPhotos?: File[] }
 
 type PhotoTab = 'upload' | 'camera'
 interface PhotoEntry { file: File; preview: string }
@@ -1067,6 +1117,16 @@ function QuickPersonModal({ person, onClose, onSaved }: ModalProps) {
       }).catch(() => {})
     }
   }, [photoTab])
+
+  useEffect(() => {
+    if (initialPhotos && initialPhotos.length > 0) {
+      initialPhotos.forEach(file => {
+        const reader = new FileReader()
+        reader.onload = e => setPhotos(prev => [...prev, { file, preview: e.target?.result as string }])
+        reader.readAsDataURL(file)
+      })
+    }
+  }, [])
 
   const addFiles = (files: FileList | null) => {
     if (!files) return
