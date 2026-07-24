@@ -47,7 +47,7 @@ RECOGNITION_THRESHOLD: float = float(os.getenv("FACE_RECOGNITION_THRESHOLD", "45
 CONFIRMATION_THRESHOLD: float = float(os.getenv("FACE_CONFIRMATION_THRESHOLD", "55")) / 100
 LOW_THRESHOLD: float = float(os.getenv("FACE_LOW_THRESHOLD", "40")) / 100
 
-INFERENCE_TIMEOUT_SECONDS: int = int(os.getenv("FACE_INFERENCE_TIMEOUT_SECONDS", "60"))
+INFERENCE_TIMEOUT_SECONDS: int = int(os.getenv("FACE_INFERENCE_TIMEOUT_SECONDS", "20"))
 # Пороги для ИЗВЛЕЧЕНИЯ ЭМБЕДДИНГА (регистрация/обучение) — максимально мягкие:
 # здесь мы ХОТИМ вытащить вектор даже из неидеального кадра (размытие/поворот/темнота).
 EMBED_MIN_DET_SCORE: float = float(os.getenv("FACE_EMBED_MIN_DET_SCORE", "0.35"))

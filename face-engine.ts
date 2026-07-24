@@ -27,8 +27,12 @@ const HEALTH_CHECK_INTERVAL_MS = Number(process.env.FACE_HEALTH_CHECK_INTERVAL) 
 const HEALTH_CHECK_TIMEOUT_MS = Number(process.env.FACE_HEALTH_CHECK_TIMEOUT) || 5_000;
 
 const FACE_REQUEST_TIMEOUT_MS = Number(process.env.FACE_REQUEST_TIMEOUT_MS) || 60_000;
+const FACE_INFERENCE_TIMEOUT_MS = Number(process.env.FACE_INFERENCE_TIMEOUT_MS) || 20_000;
 const FACE_REQUEST_RETRIES = Number(process.env.FACE_REQUEST_RETRIES) || 3;
 const FACE_RETRY_BASE_DELAY_MS = Number(process.env.FACE_RETRY_BASE_DELAY_MS) || 1000;
+
+const CIRCUIT_BREAKER_THRESHOLD = Number(process.env.FACE_CIRCUIT_BREAKER_THRESHOLD) || 5;
+const CIRCUIT_BREAKER_COOLDOWN_MS = Number(process.env.FACE_CIRCUIT_BREAKER_COOLDOWN_MS) || 30_000;
 
 // Embedding cache
 const EMBEDDING_CACHE_TTL_MS = Number(process.env.FACE_EMBEDDING_CACHE_TTL) || 5 * 60 * 1000; // 5 мин
@@ -82,6 +86,14 @@ let pythonServerCheckPromise: Promise<boolean> | null = null;
 
 /** Таймер периодического health check */
 let healthCheckTimer: ReturnType<typeof setInterval> | null = null;
+
+// ─── Circuit Breaker State ────────────────────────────────────────────────────
+
+type CircuitState = "closed" | "open" | "half-open";
+let circuitState: CircuitState = "closed";
+let circuitFailureCount = 0;
+let circuitLastFailureAt = 0;
+let circuitOpenedAt = 0;
 
 // ─── 1. HEALTH CHECK PYTHON-СЕРВЕРА ──────────────────────────────────────────
 
@@ -189,14 +201,42 @@ function stopHealthCheckTimer(): void {
  * Возвращает true если сервер доступен, false если нет.
  */
 async function ensurePythonServerAvailable(): Promise<boolean> {
+  if (circuitState === "open") {
+    const elapsed = Date.now() - circuitOpenedAt;
+    if (elapsed < CIRCUIT_BREAKER_COOLDOWN_MS) {
+      logWarn("Face Engine circuit breaker open; request blocked", {
+        cooldownRemainingMs: CIRCUIT_BREAKER_COOLDOWN_MS - elapsed,
+      });
+      return false;
+    }
+    circuitState = "half-open";
+    logInfo("Face Engine circuit breaker transitioning to half-open");
+  }
+
   const healthy = await checkPythonServerHealth();
-  if (!healthy) {
-    logWarn("Python-сервер недоступен, операция отложена", {
-      url: FACE_SERVER_URL,
-      lastCheck: new Date(pythonServerLastCheck).toISOString(),
+  if (healthy) {
+    if (circuitState !== "closed") {
+      logInfo("Face Engine circuit breaker closed after recovery");
+    }
+    circuitState = "closed";
+    circuitFailureCount = 0;
+    return true;
+  }
+
+  circuitFailureCount += 1;
+  circuitLastFailureAt = Date.now();
+  const isClosed = circuitState === "closed";
+  const isHalfOpen = circuitState === "half-open";
+  if (circuitFailureCount >= CIRCUIT_BREAKER_THRESHOLD && (isClosed || isHalfOpen)) {
+    circuitState = "open";
+    circuitOpenedAt = Date.now();
+    logError(new Error("Face Engine circuit breaker opened"), {
+      failureCount: circuitFailureCount,
+      threshold: CIRCUIT_BREAKER_THRESHOLD,
+      cooldownMs: CIRCUIT_BREAKER_COOLDOWN_MS,
     });
   }
-  return healthy;
+  return false;
 }
 
 // ─── 2. БИНАРНОЕ ХРАНЕНИЕ ДЕСКРИПТОРОВ ──────────────────────────────────────
@@ -583,6 +623,7 @@ function getApiHeaders(): Record<string, string> {
 async function apiFetchWithKey(input: string | URL, init: RequestInit = {}): Promise<any> {
   const headers = { ...(init.headers || {}), ...getApiHeaders() };
   let lastError: any;
+  let lastStatus: number | undefined;
 
   for (let attempt = 0; attempt < FACE_REQUEST_RETRIES; attempt++) {
     const controller = new AbortController();
@@ -596,6 +637,12 @@ async function apiFetchWithKey(input: string | URL, init: RequestInit = {}): Pro
       } as any);
 
       clearTimeout(timeoutId);
+      lastStatus = response.status;
+
+      if (!response.ok && response.status >= 500) {
+        throw new Error(`Server responded with status: ${response.status}`);
+      }
+
       return response;
     } catch (err) {
       clearTimeout(timeoutId);
@@ -603,12 +650,15 @@ async function apiFetchWithKey(input: string | URL, init: RequestInit = {}): Pro
 
       const isAbort = (err as Error)?.name === "AbortError";
       const isNetwork = !(err as Error)?.message?.includes("Server responded with status");
+      const isRetryable = isAbort || isNetwork || (lastStatus !== undefined && lastStatus >= 500);
 
-      if (attempt < FACE_REQUEST_RETRIES - 1 && (isAbort || isNetwork)) {
+      if (attempt < FACE_REQUEST_RETRIES - 1 && isRetryable) {
         const delay = FACE_RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
         logWarn(`Face Engine request failed (attempt ${attempt + 1}/${FACE_REQUEST_RETRIES}), retrying in ${delay}ms`, {
           input: String(input),
+          status: lastStatus,
           error: (err as Error).message,
+          retryable: true,
         });
         await new Promise((resolve) => setTimeout(resolve, delay));
         continue;
@@ -618,7 +668,13 @@ async function apiFetchWithKey(input: string | URL, init: RequestInit = {}): Pro
     }
   }
 
-  logError(lastError as Error, { context: "Face Engine API request failed", retries: FACE_REQUEST_RETRIES });
+  logError(lastError as Error, {
+    context: "Face Engine API request failed",
+    retries: FACE_REQUEST_RETRIES,
+    lastStatus,
+    circuitState,
+    failureCount: circuitFailureCount,
+  });
   throw lastError;
 }
 
