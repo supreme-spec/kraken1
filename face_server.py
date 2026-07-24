@@ -658,8 +658,16 @@ async def detect_faces(
         if img is None or img.size == 0:
             raise HTTPException(status_code=400, detail="Empty or invalid image")
 
+        height, width = img.shape[:2]
+        if width < 1280 or height < 720:
+            logger.warning(
+                "Низкое разрешение кадра: %dx%d. Рекомендуется минимум 1280x720, "
+                "идеально 1920x1080. Проверьте RTSP URL (должен заканчиваться на /101 или Channels/101).",
+                width, height,
+            )
+
         threshold = min_confidence if min_confidence is not None else MIN_DETECTION_SCORE
-        faces = await run_inference_with_timeout("detect_faces", face_app.get, img)
+        faces = await run_inference_with_timeout("detect-faces", face_app.get, img)
         results: List[Dict[str, Any]] = []
 
         for face in faces[:max_faces]:
@@ -723,7 +731,15 @@ async def assess_quality(image: UploadFile = File(...)):
                 "faces": [],
             }
 
-        faces = await run_inference_with_timeout("assess_quality", face_app.get, img)
+        height, width = img.shape[:2]
+        if width < 1280 or height < 720:
+            logger.warning(
+                "Низкое разрешение кадра: %dx%d. Рекомендуется минимум 1280x720, "
+                "идеально 1920x1080. Проверьте RTSP URL (должен заканчиваться на /101 или Channels/101).",
+                width, height,
+            )
+
+        faces = await run_inference_with_timeout("assess-quality", face_app.get, img)
         face_count = len(faces)
         valid_faces = [f for f in faces if passes_quality_gate(f)]
 
@@ -800,6 +816,14 @@ async def get_embedding(
         if img is None or img.size == 0:
             raise HTTPException(status_code=400, detail="Empty or invalid image")
 
+        height, width = img.shape[:2]
+        if width < 1280 or height < 720:
+            logger.warning(
+                "Низкое разрешение кадра: %dx%d. Рекомендуется минимум 1280x720, "
+                "идеально 1920x1080. Проверьте RTSP URL (должен заканчиваться на /101 или Channels/101).",
+                width, height,
+            )
+
         faces = await run_inference_with_timeout("get_embedding", face_app.get, img)
         if not faces:
             return {"descriptor": None, "error": "No face detected", "quality": None, "issues": ["Лицо не обнаружено"]}
@@ -865,6 +889,14 @@ async def recognize(
 
         if img is None or img.size == 0:
             raise HTTPException(status_code=400, detail="Empty or invalid image")
+
+        height, width = img.shape[:2]
+        if width < 1280 or height < 720:
+            logger.warning(
+                "Низкое разрешение кадра: %dx%d. Рекомендуется минимум 1280x720, "
+                "идеально 1920x1080. Проверьте RTSP URL (должен заканчиваться на /101 или Channels/101).",
+                width, height,
+            )
 
         faces = await run_inference_with_timeout("recognize", face_app.get, img)
         if not faces:

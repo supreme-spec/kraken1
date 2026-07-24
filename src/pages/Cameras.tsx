@@ -8,6 +8,8 @@ import ConfirmModal, { AlertModal } from '../components/ConfirmModal'
 interface FoundUsb { index: number; source: string; name: string }
 interface FoundIp { ip: string; port: number; source: string; rtsp_base?: string; common_paths?: string[]; type: string }
 
+const UNV_RTSP_EXAMPLE = "rtsp://admin:password@192.168.10.197:554/Streaming/Channels/101?tcp_transport=tcp";
+
 export default function Cameras() {
   const [cameras, setCameras] = useState<Camera[]>([])
   const [loading, setLoading] = useState(true)
@@ -432,6 +434,8 @@ function EditCameraModal({ camera, onClose, onSaved }: EditModalProps) {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
 
+  const isSubstream = /\/102\b|Channels\/102/.test(source || '')
+
   const handleSave = async () => {
     if (!name.trim()) { setError('Название обязательно'); return }
     setSaving(true)
@@ -518,7 +522,7 @@ function EditCameraModal({ camera, onClose, onSaved }: EditModalProps) {
                 rows={3}
                 spellCheck={false}
                 className="w-full bg-kraken-hover border border-kraken-border text-kraken-text text-sm px-3 py-2 rounded-lg focus:outline-none focus:border-kraken-purple font-mono resize-none leading-relaxed"
-                placeholder="rtsp://admin:password@192.168.1.100:554/stream"
+                placeholder={UNV_RTSP_EXAMPLE}
               />
             ) : (
               <input
@@ -528,6 +532,12 @@ function EditCameraModal({ camera, onClose, onSaved }: EditModalProps) {
                 className="w-full bg-kraken-hover border border-kraken-border text-kraken-text text-sm px-3 py-2 rounded-lg focus:outline-none focus:border-kraken-purple font-mono"
                 placeholder="0"
               />
+            )}
+            {isSubstream && (
+              <div className="mt-2 rounded-lg border border-yellow-500/50 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-300">
+                ⚠️ Обнаружен субпоток /102. Для распознавания лиц используйте основной поток <strong>/101</strong> (1080p).
+                Субпоток 720p может снизить точность и привести к пропускам.
+              </div>
             )}
             {/* Full path display for reference */}
             {source && (
@@ -696,6 +706,8 @@ function AddCameraModal({ onClose, onSaved, usbFound, initialSource = '', initia
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
 
+  const isSubstream = /\/102\b|Channels\/102/.test(source || '')
+
   const validateSource = () => {
     if (!source.trim()) return 'Источник обязателен'
     // Для USB-камер принимаем как числовые индексы (0,1,2), так и пути к устройствам (/dev/video0)
@@ -803,16 +815,25 @@ function AddCameraModal({ onClose, onSaved, usbFound, initialSource = '', initia
                 type="text"
                 value={source}
                 onChange={e => setSource(e.target.value)}
-                placeholder={type === 'USB' ? '0' : 'rtsp://admin:password@192.168.1.100:554/stream'}
+                placeholder={type === 'USB' ? '0' : UNV_RTSP_EXAMPLE}
                 className="w-full bg-kraken-hover border border-kraken-border text-kraken-text text-sm px-3 py-2 rounded-lg focus:outline-none focus:border-kraken-purple font-mono"
               />
+            )}
+            {isSubstream && (
+              <div className="mt-2 rounded-lg border border-yellow-500/50 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-300">
+                ⚠️ Обнаружен субпоток /102. Для распознавания лиц используйте основной поток <strong>/101</strong> (1080p).
+                Субпоток 720p может снизить точность и привести к пропускам.
+              </div>
             )}
             {(type === 'RTSP' || type === 'IP') && (
               <div className="mt-1.5 text-kraken-disabled text-xs space-y-0.5">
                 <div>Примеры RTSP путей:</div>
-                <div className="font-mono">rtsp://admin:pass@192.168.1.100:554/stream</div>
-                <div className="font-mono">rtsp://192.168.1.100:554/Streaming/Channels/101 (Hikvision)</div>
+                <div className="font-mono">rtsp://admin:pass@192.168.10.197:554/Streaming/Channels/101?tcp_transport=tcp (UNV)</div>
+                <div className="font-mono">rtsp://admin:pass@192.168.1.100:554/stream/101 (Hikvision)</div>
                 <div className="font-mono">rtsp://192.168.1.100:554/cam/realmonitor?channel=1 (Dahua)</div>
+                <div className="text-kraken-purple/80">
+                  💡 Для Uniview используйте <strong>/101</strong> (основной поток 1080p). Поток <strong>/102</strong> (720p) снижает точность распознавания.
+                </div>
               </div>
             )}
           </div>
