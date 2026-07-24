@@ -18,7 +18,10 @@ model Camera {
   is_active            Boolean   @default(true)
   created_at           DateTime  @default(now())
   status               String    @default("offline")
-  roi_zones            String?   // JSON string
+  roi_zones            String?   // JSON: detection zones
+  exclusion_zones      String?   // JSON: masks/zones to ignore
+  detection_threshold  Float?    // per-camera override, 0..1
+  min_face_size        Int?      // per-camera override, px
   fps                  Int       @default(25)
   ping_ms              Int       @default(0)
   is_smart_recording   Boolean   @default(false)

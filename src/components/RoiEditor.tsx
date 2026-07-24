@@ -20,6 +20,7 @@ interface RoiZone {
   x2: number
   y2: number
   label: string
+  type?: 'detection' | 'exclusion'
 }
 
 interface Props {
@@ -33,9 +34,13 @@ const COLORS = [
   '#ef4444', '#3b82f6', '#ec4899', '#84cc16',
 ]
 
+const EXCLUSION_COLOR = '#ef4444'
+
 export default function RoiEditor({ cameraId, cameraName, onClose }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
+
+  const [mode, setMode] = useState<'detection' | 'exclusion'>('detection')
 
   // Original frame dimensions (from snapshot)
   const [origW, setOrigW] = useState(0)
@@ -94,8 +99,8 @@ export default function RoiEditor({ cameraId, cameraName, onClose }: Props) {
 
   const loadZones = useCallback(async () => {
     try {
-      const data = await apiFetch<{ zones: RoiZone[] }>(`/cameras/${cameraId}/roi`)
-      setZones(data.zones || [])
+      const data = await apiFetch<{ zones: RoiZone[]; exclusion_zones?: RoiZone[] }>(`/cameras/${cameraId}/roi`)
+      setZones([...(data.zones || []), ...(data.exclusion_zones || [])])
     } catch {
       setZones([])
     }
@@ -135,19 +140,24 @@ export default function RoiEditor({ cameraId, cameraName, onClose }: Props) {
 
     // Draw saved zones
     zones.forEach((z, i) => {
-      const color = COLORS[i % COLORS.length]
       const cx = z.x1 * scaleX
       const cy = z.y1 * scaleY
       const cw = (z.x2 - z.x1) * scaleX
       const ch = (z.y2 - z.y1) * scaleY
+      const isExclusion = z.type === 'exclusion'
+      const color = isExclusion ? EXCLUSION_COLOR : COLORS[i % COLORS.length]
 
-      // Bright fill inside zone (cut through dim)
-      ctx.drawImage(bgImage, z.x1, z.y1, z.x2 - z.x1, z.y2 - z.y1, cx, cy, cw, ch)
+      if (isExclusion) {
+        ctx.fillStyle = 'rgba(239, 68, 68, 0.35)'
+        ctx.fillRect(cx, cy, cw, ch)
+      } else {
+        ctx.drawImage(bgImage, z.x1, z.y1, z.x2 - z.x1, z.y2 - z.y1, cx, cy, cw, ch)
+      }
 
       // Border
       ctx.strokeStyle = color
       ctx.lineWidth = 2
-      ctx.setLineDash([])
+      ctx.setLineDash(isExclusion ? [6, 3] : [])
       ctx.strokeRect(cx, cy, cw, ch)
 
       // Label background
@@ -237,6 +247,7 @@ export default function RoiEditor({ cameraId, cameraName, onClose }: Props) {
         x2: Math.round(ox2.x),
         y2: Math.round(ox2.y),
         label,
+        type: mode,
       },
     ])
     // Auto-increment label number
@@ -263,7 +274,7 @@ export default function RoiEditor({ cameraId, cameraName, onClose }: Props) {
     setConfirmState({
       isOpen: true,
       title: 'Удалить все зоны',
-      message: 'Удалить все зоны детектирования?',
+      message: 'Удалить все зоны детектирования и маски?',
       isDamage: true,
       onConfirm: () => {
         setConfirmState(null)
@@ -272,15 +283,40 @@ export default function RoiEditor({ cameraId, cameraName, onClose }: Props) {
     })
   }
 
+  const applyMetalDetectorPreset = () => {
+    if (!origW || !origH) return
+    const cx = Math.round(origW * 0.5)
+    const cy = Math.round(origH * 0.5)
+    const zw = Math.round(origW * 0.35)
+    const zh = Math.round(origH * 0.6)
+    const x1 = Math.max(0, cx - Math.round(zw / 2))
+    const y1 = Math.max(0, cy - Math.round(zh / 2))
+    const x2 = Math.min(origW, cx + Math.round(zw / 2))
+    const y2 = Math.min(origH, cy + Math.round(zh / 2))
+    const lw = Math.round(origW * 0.18)
+    const lh = Math.round(origH * 0.7)
+    const ly = Math.max(0, Math.round(origH * 0.15))
+    const exclusionLeft = { x1: 0, y1: ly, x2: lw, y2: ly + lh, label: 'Охранник', type: 'exclusion' as const }
+    const exclusionRight = { x1: Math.max(0, origW - lw), y1: ly, x2: origW, y2: ly + lh, label: 'Терминал', type: 'exclusion' as const }
+    const detection = { x1, y1, x2, y2, label: 'Металлоискатель', type: 'detection' as const }
+    setZones([detection, exclusionLeft, exclusionRight])
+    setMode('detection')
+  }
+
   // ── Save ──────────────────────────────────────────────────────────────────
 
   const handleSave = async () => {
     setSaving(true)
     setError('')
     try {
+      const detectionZones = zones.filter(z => z.type !== 'exclusion').map(({ type, ...rest }) => rest)
+      const exclusionZones = zones.filter(z => z.type === 'exclusion').map(({ type, ...rest }) => rest)
       await apiFetch(`/cameras/${cameraId}/roi`, {
         method: 'PUT',
-        body: JSON.stringify({ zones }),
+        body: JSON.stringify({
+          roi_zones: detectionZones,
+          exclusion_zones: exclusionZones.length > 0 ? exclusionZones : null,
+        }),
       })
       onClose()
     } catch (e: any) {
@@ -296,16 +332,39 @@ export default function RoiEditor({ cameraId, cameraName, onClose }: Props) {
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
       <div className="panel flex flex-col w-full max-w-3xl mx-4 max-h-[95vh] overflow-hidden animate-fade-in">
 
-        {/* Header */}
-        <div className="flex items-center justify-between px-5 py-4 border-b border-kraken-border flex-shrink-0">
-          <div>
-            <h2 className="text-kraken-text font-bold text-base">Зоны детектирования</h2>
-            <p className="text-kraken-muted text-xs mt-0.5">{cameraName}</p>
-          </div>
-          <button onClick={onClose} className="text-kraken-muted hover:text-kraken-text">
-            <X size={18} />
-          </button>
-        </div>
+         {/* Header */}
+         <div className="flex items-center justify-between px-5 py-4 border-b border-kraken-border flex-shrink-0">
+           <div>
+             <h2 className="text-kraken-text font-bold text-base">Зоны детектирования и маски</h2>
+             <p className="text-kraken-muted text-xs mt-0.5">{cameraName}</p>
+           </div>
+           <button onClick={onClose} className="text-kraken-muted hover:text-kraken-text">
+             <X size={18} />
+           </button>
+         </div>
+
+         {/* Mode switcher */}
+         <div className="px-5 pt-4 flex items-center gap-2 flex-wrap">
+           <button
+             onClick={() => setMode('detection')}
+             className={`text-xs px-3 py-1.5 rounded-lg border transition-colors ${mode === 'detection' ? 'bg-kraken-purple/20 border-kraken-purple text-kraken-purple' : 'bg-kraken-hover border-kraken-border text-kraken-muted hover:text-kraken-text'}`}
+           >
+             Зоны детекции
+           </button>
+           <button
+             onClick={() => setMode('exclusion')}
+             className={`text-xs px-3 py-1.5 rounded-lg border transition-colors ${mode === 'exclusion' ? 'bg-red-500/20 border-red-500 text-red-400' : 'bg-kraken-hover border-kraken-border text-kraken-muted hover:text-kraken-text'}`}
+           >
+             Маски (исключить)
+           </button>
+           <span className="text-kraken-disabled text-xs ml-2">
+             {mode === 'detection' ? 'Детектор работает только внутри фиолетовых зон' : 'В красных зонах лицо игнорируется'}
+           </span>
+           <button onClick={() => applyMetalDetectorPreset()}
+             className="text-xs ml-auto px-2 py-1 rounded-lg bg-kraken-purple/10 text-kraken-purple hover:bg-kraken-purple/20 transition-colors">
+             Пресет: металлоискатель
+           </button>
+         </div>
 
         {/* Canvas area */}
         <div ref={containerRef} className="flex-1 overflow-auto px-5 pt-4 min-h-0">

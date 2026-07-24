@@ -236,6 +236,16 @@ let recordingsData: Record<number, Record<string, any[]>> = {};
 function sanitizeCamera(cam: any): any {
   if (!cam) return cam;
   const { username, password, ...safe } = cam;
+  try {
+    if (typeof safe.roi_zones === "string") {
+      safe.roi_zones = JSON.parse(safe.roi_zones);
+    }
+    if (typeof safe.exclusion_zones === "string") {
+      safe.exclusion_zones = JSON.parse(safe.exclusion_zones);
+    }
+  } catch {
+    // keep raw values if parse fails
+  }
   return safe;
 }
 
@@ -675,6 +685,9 @@ app.post(["/api/cameras", "/api/cameras/"], async (req, res) => {
         is_active: req.body.is_active !== false,
         status: "online",
         roi_zones: req.body.roi_zones || null,
+        exclusion_zones: req.body.exclusion_zones || null,
+        detection_threshold: req.body.detection_threshold ?? null,
+        min_face_size: req.body.min_face_size ?? null,
         fps: 25,
         ping_ms: 0,
         is_smart_recording: req.body.is_smart_recording || false,
@@ -712,6 +725,116 @@ app.put("/api/cameras/:id", async (req, res) => {
   } catch (err) {
     logError(err as Error, { path: "/api/cameras/:id", method: "PUT" });
     res.status(404).json({ detail: "Camera not found" });
+  }
+});
+
+app.get(["/api/cameras/:id/roi", "/api/cameras/:id/roi/"], async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    let cam = cameras.find((c) => c.id === id);
+    if (!cam) {
+      cam = await prisma.camera.findUnique({ where: { id } });
+    }
+    if (!cam) return res.status(404).json({ detail: "Camera not found" });
+    let roiZones = cam.roi_zones;
+    let exclusionZones = cam.exclusion_zones;
+    if (typeof roiZones === "string") {
+      try { roiZones = JSON.parse(roiZones); } catch { roiZones = []; }
+    }
+    if (typeof exclusionZones === "string") {
+      try { exclusionZones = JSON.parse(exclusionZones); } catch { exclusionZones = []; }
+    }
+    res.json({ zones: roiZones || [], exclusion_zones: exclusionZones || [] });
+  } catch (err) {
+    logError(err as Error, { path: "/api/cameras/:id/roi", method: "GET" });
+    res.status(500).json({ detail: "Internal server error" });
+  }
+});
+
+app.put(["/api/cameras/:id/roi", "/api/cameras/:id/roi/"], async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const { roi_zones, exclusion_zones } = req.body || {};
+    const updated = await prisma.camera.update({
+      where: { id },
+      data: {
+        roi_zones: roi_zones ? JSON.stringify(roi_zones) : undefined,
+        exclusion_zones: exclusion_zones ? JSON.stringify(exclusion_zones) : undefined,
+      },
+    });
+    const index = cameras.findIndex((c) => c.id === id);
+    if (index >= 0) cameras[index] = { ...cameras[index], ...updated };
+    res.json(sanitizeCamera(updated));
+  } catch (err) {
+    logError(err as Error, { path: "/api/cameras/:id/roi", method: "PUT" });
+    res.status(404).json({ detail: "Camera not found" });
+  }
+});
+
+// Preset for metal detector setup
+app.post(["/api/setup/metal-detector", "/api/setup/metal-detector/"], async (req, res) => {
+  try {
+    const { camera_id, name, source } = req.body || {};
+    let targetId = camera_id;
+
+    if (!targetId && name && source) {
+      const created = await prisma.camera.create({
+        data: {
+          name,
+          source,
+          camera_type: "RTSP",
+          zone: "Металлоискатель",
+          is_active: true,
+          status: "online",
+          detection_threshold: 0.8,
+          min_face_size: 80,
+        },
+      });
+      targetId = created.id;
+      cameras.push({ ...created });
+    }
+
+    if (!targetId) {
+      return res.status(400).json({ detail: "camera_id или name+source обязательны" });
+    }
+
+    const cam = await prisma.camera.findUnique({ where: { id: targetId } });
+    if (!cam) return res.status(404).json({ detail: "Camera not found" });
+
+    const w = 1280
+    const h = 720
+    const cx = Math.round(w * 0.5)
+    const cy = Math.round(h * 0.5)
+    const zw = Math.round(w * 0.35)
+    const zh = Math.round(h * 0.6)
+    const x1 = Math.max(0, cx - Math.round(zw / 2))
+    const y1 = Math.max(0, cy - Math.round(zh / 2))
+    const x2 = Math.min(w, cx + Math.round(zw / 2))
+    const y2 = Math.min(h, cy + Math.round(zh / 2))
+    const lw = Math.round(w * 0.18)
+    const lh = Math.round(h * 0.7)
+    const ly = Math.max(0, Math.round(h * 0.15))
+
+    const updated = await prisma.camera.update({
+      where: { id: targetId },
+      data: {
+        detection_threshold: 0.8,
+        min_face_size: 80,
+        roi_zones: JSON.stringify([{ x1, y1, x2, y2, label: "Металлоискатель", type: "detection" }]),
+        exclusion_zones: JSON.stringify([
+          { x1: 0, y1: ly, x2: lw, y2: ly + lh, label: "Охранник", type: "exclusion" },
+          { x1: Math.max(0, w - lw), y1: ly, x2: w, y2: ly + lh, label: "Терминал", type: "exclusion" },
+        ]),
+      },
+    });
+
+    const index = cameras.findIndex((c) => c.id === targetId);
+    if (index >= 0) cameras[index] = { ...cameras[index], ...updated };
+
+    res.json(sanitizeCamera(updated));
+  } catch (err) {
+    logError(err as Error, { path: "/api/setup/metal-detector", method: "POST" });
+    res.status(500).json({ detail: "Internal server error" });
   }
 });
 

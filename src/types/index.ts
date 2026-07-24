@@ -47,6 +47,7 @@ export interface RoiZone {
   x2: number
   y2: number
   label: string
+  type?: 'detection' | 'exclusion'
 }
 
 export interface Camera {
@@ -59,6 +60,9 @@ export interface Camera {
   created_at: string
   status: 'online' | 'offline' | 'connecting' | 'reconnecting'
   roi_zones?: RoiZone[] | null
+  exclusion_zones?: RoiZone[] | null
+  detection_threshold?: number | null
+  min_face_size?: number | null
   fps?: number | null
   ping_ms?: number | null
   is_smart_recording: boolean

@@ -288,6 +288,15 @@ export default function Cameras() {
                   {cam.roi_zones.length} {cam.roi_zones.length === 1 ? 'зона' : cam.roi_zones.length < 5 ? 'зоны' : 'зон'}
                 </span>
               )}
+              {cam.exclusion_zones && cam.exclusion_zones.length > 0 && (
+                <span
+                  className="bg-red-500/20 text-red-400 px-2 py-0.5 rounded cursor-pointer hover:bg-red-500/30 transition-colors"
+                  onClick={() => setRoiCamera(cam)}
+                  title="Маски (исключить зоны)"
+                >
+                  {cam.exclusion_zones.length} {cam.exclusion_zones.length === 1 ? 'маска' : cam.exclusion_zones.length < 5 ? 'маски' : 'масок'}
+                </span>
+              )}
             </div>
 
             {/* Action buttons */}
@@ -416,6 +425,8 @@ function EditCameraModal({ camera, onClose, onSaved }: EditModalProps) {
   const [username, setUsername] = useState(camera.username ?? '')
   const [password, setPassword] = useState(camera.password ?? '')
   const [useAnalytics, setUseAnalytics] = useState(camera.use_camera_analytics ?? false)
+  const [detectionThreshold, setDetectionThreshold] = useState<number>(camera.detection_threshold ?? 0.8)
+  const [minFaceSize, setMinFaceSize] = useState<number>(camera.min_face_size ?? 80)
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
@@ -423,7 +434,6 @@ function EditCameraModal({ camera, onClose, onSaved }: EditModalProps) {
 
   const handleSave = async () => {
     if (!name.trim()) { setError('Название обязательно'); return }
-    if (!source.trim()) { setError('Источник обязателен'); return }
     setSaving(true)
     setError('')
     try {
@@ -440,6 +450,8 @@ function EditCameraModal({ camera, onClose, onSaved }: EditModalProps) {
           username: username.trim() || null,
           password: password || null,
           use_camera_analytics: useAnalytics,
+          detection_threshold: detectionThreshold,
+          min_face_size: minFaceSize,
         }),
       })
       onSaved()
@@ -618,6 +630,26 @@ function EditCameraModal({ camera, onClose, onSaved }: EditModalProps) {
             </label>
           </div>
 
+          <div className="border border-kraken-border rounded-xl p-3 space-y-3">
+            <div className="text-kraken-muted text-xs uppercase tracking-widest">Детекция лиц</div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-kraken-muted text-[10px] mb-0.5 block">Порог уверенности</label>
+                <input type="number" step="0.01" min="0.1" max="1" value={detectionThreshold} onChange={e => setDetectionThreshold(parseFloat(e.target.value))}
+                  className="w-full bg-kraken-hover border border-kraken-border text-kraken-text text-xs px-2 py-1.5 rounded-lg focus:outline-none focus:border-kraken-purple font-mono" />
+              </div>
+              <div>
+                <label className="text-kraken-muted text-[10px] mb-0.5 block">Мин. размер лица (px)</label>
+                <input type="number" step="1" min="20" max="500" value={minFaceSize} onChange={e => setMinFaceSize(parseInt(e.target.value) || 0)}
+                  className="w-full bg-kraken-hover border border-kraken-border text-kraken-text text-xs px-2 py-1.5 rounded-lg focus:outline-none focus:border-kraken-purple font-mono" />
+              </div>
+            </div>
+            <button onClick={() => { setDetectionThreshold(0.8); setMinFaceSize(80) }}
+              className="text-xs px-2 py-1 rounded-lg bg-kraken-purple/10 text-kraken-purple hover:bg-kraken-purple/20 transition-colors">
+              Пресет: металлоискатель (0.80 / 80px)
+            </button>
+          </div>
+
           {error && (
             <div className="text-kraken-red text-sm bg-kraken-red/10 px-3 py-2 rounded-lg">
               {error}
@@ -659,6 +691,8 @@ function AddCameraModal({ onClose, onSaved, usbFound, initialSource = '', initia
   const [username, setUsername] = useState('admin')
   const [password, setPassword] = useState('')
   const [useAnalytics, setUseAnalytics] = useState(false)
+  const [detectionThreshold, setDetectionThreshold] = useState<number>(0.8)
+  const [minFaceSize, setMinFaceSize] = useState<number>(80)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
 
@@ -699,6 +733,8 @@ function AddCameraModal({ onClose, onSaved, usbFound, initialSource = '', initia
           username: username.trim() || null,
           password: password || null,
           use_camera_analytics: useAnalytics,
+          detection_threshold: detectionThreshold,
+          min_face_size: minFaceSize,
         }),
       })
       onSaved()
@@ -833,9 +869,29 @@ function AddCameraModal({ onClose, onSaved, usbFound, initialSource = '', initia
                 </label>
               )}
             </div>
-          )}
+           )}
 
-          <div className="flex gap-4 p-3 bg-kraken-base rounded-xl border border-kraken-border">
+           <div className="border border-kraken-border rounded-xl p-3 space-y-3">
+             <div className="text-kraken-muted text-xs uppercase tracking-widest">Детекция лиц</div>
+             <div className="grid grid-cols-2 gap-3">
+               <div>
+                 <label className="text-kraken-muted text-[10px] mb-0.5 block">Порог уверенности</label>
+                 <input type="number" step="0.01" min="0.1" max="1" value={detectionThreshold} onChange={e => setDetectionThreshold(parseFloat(e.target.value))}
+                   className="w-full bg-kraken-hover border border-kraken-border text-kraken-text text-xs px-2 py-1.5 rounded-lg focus:outline-none focus:border-kraken-purple font-mono" />
+               </div>
+               <div>
+                 <label className="text-kraken-muted text-[10px] mb-0.5 block">Мин. размер лица (px)</label>
+                 <input type="number" step="1" min="20" max="500" value={minFaceSize} onChange={e => setMinFaceSize(parseInt(e.target.value) || 0)}
+                   className="w-full bg-kraken-hover border border-kraken-border text-kraken-text text-xs px-2 py-1.5 rounded-lg focus:outline-none focus:border-kraken-purple font-mono" />
+               </div>
+             </div>
+             <button onClick={() => { setDetectionThreshold(0.8); setMinFaceSize(80) }}
+               className="text-xs px-2 py-1 rounded-lg bg-kraken-purple/10 text-kraken-purple hover:bg-kraken-purple/20 transition-colors">
+               Пресет: металлоискатель (0.80 / 80px)
+             </button>
+           </div>
+
+           <div className="flex gap-4 p-3 bg-kraken-base rounded-xl border border-kraken-border">
             <label className="flex-1 flex items-center gap-2 cursor-pointer group">
               <input
                 type="checkbox"
