@@ -247,16 +247,16 @@ export default function LiveMonitor({
     setTimeout(() => setCaptureMsg(''), 3000)
   }, [selectedCameraId])
 
-  // ── W/Ц: нажали — начать запись, отпустили — остановить ─────────────────────
+  // ── Ctrl+W: нажали — начать умную запись, отпустили — остановить ───────────
   useEffect(() => {
     const handleKeyDown = async (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
       if (e.repeat) return // не реагировать на автоповтор клавиши
 
       const key = e.key.toLowerCase()
-      const isRecordKey = key === 'w' || key === 'ц' || e.code === 'KeyW'
+      const isSmartRecordKey = e.ctrlKey && (key === 'w' || key === 'ц' || e.code === 'KeyW')
       const isCaptureKey = key === 's' || key === 'ы' || e.code === 'KeyS'
-      if (isRecordKey) {
+      if (isSmartRecordKey) {
         if (!selectedCameraId || isRecording) return
         e.preventDefault()
         try {
@@ -266,9 +266,9 @@ export default function LiveMonitor({
             headers: token ? { Authorization: `Bearer ${token}` } : {},
           })
           setIsRecording(true)
-          setRecordingMsg('🔴 Запись...')
+          setRecordingMsg('🔴 Умная запись...')
         } catch (e) {
-          console.error('Recording start error:', e)
+          console.error('Smart recording start error:', e)
           setRecordingMsg('❌ Ошибка записи')
         }
       }
@@ -284,8 +284,8 @@ export default function LiveMonitor({
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
 
       const key = e.key.toLowerCase()
-      const isRecordKey = key === 'w' || key === 'ц' || e.code === 'KeyW'
-      if (isRecordKey) {
+      const isSmartRecordKey = e.ctrlKey && (key === 'w' || key === 'ц' || e.code === 'KeyW')
+      if (isSmartRecordKey) {
         if (!selectedCameraId || !isRecording) return
         e.preventDefault()
         try {

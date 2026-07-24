@@ -66,6 +66,9 @@ interface EmbeddingCacheEntry {
 
 let isInitialized = false;
 
+/** Конфигурация лимитов эмбеддингов */
+export const MAX_EMBEDDINGS_PER_PERSON = Number(process.env.KRAKEN_MAX_EMBEDDINGS_PER_PERSON || 15);
+
 /** Дескрипторы в памяти — partitioned по категориям для ускорения поиска */
 const storedDescriptors: Array<{
   personId: number;
@@ -74,6 +77,7 @@ const storedDescriptors: Array<{
   photoPath: string;
   descriptor: Float32Array;
   descriptorList: number[];
+  createdAt: number;
 }> = [];
 
 /** Кэш эмбеддингов: pathHash -> { descriptor, timestamp } */
@@ -396,6 +400,7 @@ async function loadDescriptorsFromDB(): Promise<void> {
           photoPath: d.photo_path,
           descriptor,
           descriptorList,
+          createdAt: new Date(d.created_at).getTime(),
         });
       } catch (parseErr) {
         logError(parseErr as Error, { context: "Парсинг дескриптора из БД", descriptorId: d.id });
@@ -608,6 +613,10 @@ export function getEngineStatus(): {
     pythonServer: getPythonServerStatus(),
     cacheSize: embeddingCache.size,
   };
+}
+
+export function getEmbeddingCountForPerson(personId: number): number {
+  return storedDescriptors.filter((d) => d.personId === personId).length;
 }
 
 // ─── API РАБОТЫ С PYTHON-СЕРВЕРОМ ────────────────────────────────────────────
@@ -1070,14 +1079,40 @@ export async function registerPerson(
       storedDescriptors.splice(existingIdx, 1);
     }
 
+    // Smart Replacement: если достигнут лимит — удаляем самый старый дескриптор этой персоны
+    const currentCount = storedDescriptors.filter(d => d.personId === personId).length;
+    if (currentCount >= MAX_EMBEDDINGS_PER_PERSON) {
+      const oldestEntry = storedDescriptors
+        .filter(d => d.personId === personId)
+        .sort((a, b) => a.createdAt - b.createdAt)[0];
+      if (oldestEntry) {
+        const removeIdx = storedDescriptors.indexOf(oldestEntry);
+        if (removeIdx >= 0) {
+          storedDescriptors.splice(removeIdx, 1);
+          try {
+            await prisma.faceDescriptor.deleteMany({
+              where: {
+                person_id: personId,
+                photo_path: oldestEntry.photoPath,
+              },
+            });
+          } catch (e) {
+            logWarn("Не удалось удалить старый дескриптор из БД при Smart Replacement", { error: (e as Error).message });
+          }
+          logDebug(`[SmartReplacement] Удалён старый дескриптор (${new Date(oldestEntry.createdAt).toISOString()}) для "${personName}" (ID: ${personId})`);
+        }
+      }
+    }
+
     // Добавляем новый дескриптор
     storedDescriptors.push({
       personId,
       personName,
       category,
       photoPath,
-      descriptor,
+      descriptor: descriptor,
       descriptorList: Array.from(descriptor),
+      createdAt: Date.now(),
     });
 
     // Сохраняем в БД (бинарный формат с fallback на JSON)
@@ -1116,6 +1151,22 @@ export async function registerPersonFromDescriptor(
       storedDescriptors.splice(existingIdx, 1);
     }
 
+    // Smart Replacement: если достигнут лимит — удаляем самый старый дескриптор этой персоны
+    const currentCount = storedDescriptors.filter(d => d.personId === personId).length;
+    if (currentCount >= MAX_EMBEDDINGS_PER_PERSON) {
+      const oldestIdx = storedDescriptors
+        .filter(d => d.personId === personId)
+        .sort((a, b) => a.createdAt - b.createdAt)[0];
+      if (oldestIdx) {
+        const removeIdx = storedDescriptors.indexOf(oldestIdx);
+        if (removeIdx >= 0) {
+          const removed = storedDescriptors[removeIdx];
+          storedDescriptors.splice(removeIdx, 1);
+          logDebug(`[SmartReplacement] Удалён старый дескриптор (${new Date(removed.createdAt).toISOString()}) для "${personName}" (ID: ${personId})`);
+        }
+      }
+    }
+
     // Добавляем новый дескриптор
     storedDescriptors.push({
       personId,
@@ -1124,6 +1175,7 @@ export async function registerPersonFromDescriptor(
       photoPath,
       descriptor: desc,
       descriptorList: Array.from(desc),
+      createdAt: Date.now(),
     });
 
     // Сохраняем в БД (бинарный формат с fallback на JSON)
@@ -1178,6 +1230,57 @@ export async function addEmbeddingToPerson(
     );
     if (existingIdx >= 0) storedDescriptors.splice(existingIdx, 1);
 
+    // Smart Replacement: если достигнут лимит — удаляем самый старый дескриптор этой персоны
+    const currentCount = storedDescriptors.filter(d => d.personId === personId).length;
+    if (currentCount >= MAX_EMBEDDINGS_PER_PERSON) {
+      const oldestEntry = storedDescriptors
+        .filter(d => d.personId === personId)
+        .sort((a, b) => a.createdAt - b.createdAt)[0];
+      if (oldestEntry) {
+        const removeIdx = storedDescriptors.indexOf(oldestEntry);
+        if (removeIdx >= 0) {
+          storedDescriptors.splice(removeIdx, 1);
+          try {
+            await prisma.faceDescriptor.deleteMany({
+              where: {
+                person_id: personId,
+                photo_path: oldestEntry.photoPath,
+              },
+            });
+          } catch (e) {
+            logWarn("Не удалось удалить старый дескриптор из БД при Smart Replacement (registerPerson)", { error: (e as Error).message });
+          }
+          logDebug(`[SmartReplacement] Удалён старый дескриптор для "${personName}" (ID: ${personId}) при первичной регистрации`);
+        }
+      }
+    }
+
+    // Добавляем новый дескриптор
+    // Smart Replacement: если достигнут лимит — удаляем самый старый дескриптор этой персоны
+    const currentCountAdd = storedDescriptors.filter(d => d.personId === personId).length;
+    if (currentCountAdd >= MAX_EMBEDDINGS_PER_PERSON) {
+      const oldestEntryAdd = storedDescriptors
+        .filter(d => d.personId === personId)
+        .sort((a, b) => a.createdAt - b.createdAt)[0];
+      if (oldestEntryAdd) {
+        const removeIdxAdd = storedDescriptors.indexOf(oldestEntryAdd);
+        if (removeIdxAdd >= 0) {
+          storedDescriptors.splice(removeIdxAdd, 1);
+          try {
+            await prisma.faceDescriptor.deleteMany({
+              where: {
+                person_id: personId,
+                photo_path: oldestEntryAdd.photoPath,
+              },
+            });
+          } catch (e) {
+            logWarn("Не удалось удалить старый дескриптор из БД при Smart Replacement (addEmbedding)", { error: (e as Error).message });
+          }
+          logDebug(`[SmartReplacement] Удалён старый дескриптор для "${personName}" (ID: ${personId}) при добавлении доп. эмбеддинга`);
+        }
+      }
+    }
+
     storedDescriptors.push({
       personId,
       personName,
@@ -1185,6 +1288,7 @@ export async function addEmbeddingToPerson(
       photoPath,
       descriptor: desc,
       descriptorList: Array.from(desc),
+      createdAt: Date.now(),
     });
 
     const saved = await saveDescriptorToDB(personId, personName, category, photoPath, desc);

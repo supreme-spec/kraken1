@@ -35,6 +35,7 @@ import {
   assessPhotoQuality,
   searchByDescriptor,
   addEmbeddingToPerson,
+  getEmbeddingCountForPerson,
 } from "./face-engine.js";
 import { prisma } from "./db.js";
 import logger, { logInfo, logError, logWarn, logDebug } from "./src/lib/logger.js";
@@ -739,6 +740,7 @@ async function processCameraEventInBackground(camera: any) {
     
     if (camera.detection_threshold) form.append("threshold", String(camera.detection_threshold));
     if (camera.min_face_size) form.append("min_face_size", String(camera.min_face_size));
+    if (camera.max_face_size) form.append("max_face_size", String(camera.max_face_size));
     if (camera.passage_roi_x_min != null) form.append("passage_roi_x_min", String(camera.passage_roi_x_min));
     if (camera.passage_roi_x_max != null) form.append("passage_roi_x_max", String(camera.passage_roi_x_max));
     if (camera.passage_roi_y_min != null) form.append("passage_roi_y_min", String(camera.passage_roi_y_min));
@@ -912,6 +914,7 @@ app.post(["/api/cameras", "/api/cameras/"], async (req, res) => {
         exclusion_zones: req.body.exclusion_zones || null,
         detection_threshold: req.body.detection_threshold ?? null,
         min_face_size: req.body.min_face_size ?? null,
+        max_face_size: req.body.max_face_size ?? null,
         fps: 25,
         ping_ms: 0,
         is_smart_recording: req.body.is_smart_recording || false,
@@ -1997,6 +2000,10 @@ async function enrollPhotoWithGate(
   }
 
   const reg = await registerPersonFromDescriptor(personId, personName, category, photo_path, ext.descriptor);
+  if (reg.hasEmbedding) {
+    const count = getEmbeddingCountForPerson(personId);
+    await prisma.person.update({ where: { id: personId }, data: { embedding_count: count } }).catch(() => {});
+  }
   return { hasEmbedding: reg.hasEmbedding, error: reg.error };
 }
 
@@ -2078,6 +2085,9 @@ app.post(["/api/confirmations/:id/approve", "/api/confirmations/:id/approve/"], 
     const reg = await addEmbeddingToPerson(conf.person_id, person.name, person.category, photo_path, descriptor);
     if (!reg.success) return res.status(500).json({ detail: reg.error || "Не удалось добавить дескриптор" });
 
+    const countAfterAdd = getEmbeddingCountForPerson(conf.person_id);
+    await prisma.person.update({ where: { id: conf.person_id }, data: { embedding_count: countAfterAdd } }).catch(() => {});
+
     await prisma.faceConfirmation.update({
       where: { id },
       data: { status: "APPROVED", confirmed_at: new Date(), confirmed_by: operator_id },
@@ -2131,9 +2141,10 @@ app.post(["/api/confirmations/:id/reject", "/api/confirmations/:id/reject/"], as
       await prisma.personPhoto.create({
         data: { person_id: newPerson.id, photo_path, is_primary: true, has_embedding: reg.hasEmbedding },
       });
+      const countForNew = getEmbeddingCountForPerson(newPerson.id);
       await prisma.person.update({
         where: { id: newPerson.id },
-        data: { photo_path, embedding_count: reg.hasEmbedding ? 1 : 0 },
+        data: { photo_path, embedding_count: countForNew },
       });
 
       const created = await prisma.person.findUnique({ where: { id: newPerson.id }, include: { photos: true } });
@@ -2180,12 +2191,16 @@ app.get(["/api/confirmations/stats", "/api/confirmations/stats/"], async (req, r
 app.get(["/api/events", "/api/events/"], async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit as string || "50"), 200);
+    const lastId = parseInt(req.query.last_id as string || "0");
+    const where = lastId > 0 ? { id: { lt: lastId } } : {};
     const eventsFromDB = await prisma.event.findMany({
-      orderBy: { created_at: "desc" },
+      where,
+      orderBy: { id: "desc" },
       take: limit,
       include: { person: { select: { photo_path: true } } },
     });
-    res.json(eventsFromDB);
+    const nextCursor = eventsFromDB.length > 0 ? eventsFromDB[eventsFromDB.length - 1].id : null;
+    res.json({ events: eventsFromDB, next_cursor: nextCursor });
   } catch (err) {
     logError(err as Error, { path: "/api/events", method: "GET" });
     res.status(500).json({ detail: "Internal server error" });
@@ -3183,6 +3198,9 @@ const UNKNOWN_PERSON_COOLDOWN_MS = 60_000;
 const lastEventAt = new Map<string, number>();
 // cameraId -> последнее время создания персоны из неизвестного (защита от дублей)
 const lastUnknownPersonAt = new Map<string, number>();
+// Дедупликация событий: camera:person:type -> { eventId, created_at }
+const recentEventDedup = new Map<string, { eventId: number; created_at: number }>();
+const RECENT_EVENT_DEDUP_MS = 15_000;
 
 function saveSnapshotFromFrame(frameBase64: string, cameraId: number, label?: string): string {
   try {
@@ -3218,22 +3236,64 @@ async function persistAndBroadcastEvent(e: {
   confirmationId?: number;
 }) {
   try {
-    await prisma.event.create({
-      data: {
-        camera_id: e.cameraId,
-        camera_name: e.cameraName,
-        person_id: e.personId,
-        event_type: e.event_type,
-        confidence: e.confidence,
-        snapshot_path: e.snapshot_path,
-        person_name: e.person_name,
-        person_category: e.person_category,
-        person_photo_path: e.person_photo_path,
-        needs_operator_confirmation: e.needs_operator_confirmation ?? false,
-        confirmation_status: e.confirmation_status ?? null,
-        confirmation_id: e.confirmationId ?? null,
-      },
-    });
+    let eventId: number | undefined;
+    const now = Date.now();
+
+    if (e.personId && e.event_type !== 'UNKNOWN') {
+      const dedupKey = `${e.cameraId}:${e.personId}:${e.event_type}`;
+      const recent = recentEventDedup.get(dedupKey);
+      if (recent && now - recent.created_at < RECENT_EVENT_DEDUP_MS) {
+        await prisma.event.update({
+          where: { id: recent.eventId },
+          data: {
+            confidence: Math.max(e.confidence, e.confidence),
+            snapshot_path: e.snapshot_path,
+            needs_operator_confirmation: e.needs_operator_confirmation ?? false,
+            confirmation_status: e.confirmation_status ?? null,
+            confirmation_id: e.confirmationId ?? null,
+          },
+        });
+        eventId = recent.eventId;
+      } else {
+        const created = await prisma.event.create({
+          data: {
+            camera_id: e.cameraId,
+            camera_name: e.cameraName,
+            person_id: e.personId,
+            event_type: e.event_type,
+            confidence: e.confidence,
+            snapshot_path: e.snapshot_path,
+            person_name: e.person_name,
+            person_category: e.person_category,
+            person_photo_path: e.person_photo_path,
+            needs_operator_confirmation: e.needs_operator_confirmation ?? false,
+            confirmation_status: e.confirmation_status ?? null,
+            confirmation_id: e.confirmationId ?? null,
+          },
+        });
+        eventId = created.id;
+        recentEventDedup.set(dedupKey, { eventId: created.id, created_at: now });
+      }
+    } else {
+      const created = await prisma.event.create({
+        data: {
+          camera_id: e.cameraId,
+          camera_name: e.cameraName,
+          person_id: e.personId,
+          event_type: e.event_type,
+          confidence: e.confidence,
+          snapshot_path: e.snapshot_path,
+          person_name: e.person_name,
+          person_category: e.person_category,
+          person_photo_path: e.person_photo_path,
+          needs_operator_confirmation: e.needs_operator_confirmation ?? false,
+          confirmation_status: e.confirmation_status ?? null,
+          confirmation_id: e.confirmationId ?? null,
+        },
+      });
+      eventId = created.id;
+    }
+
     broadcastSecurity({
       type: "ALERT",
       category: (e.person_category as any) || "UNKNOWN",
@@ -3295,7 +3355,8 @@ async function handleRecognizedEvent(cam: any, match: any, frameBase64: string) 
     confirmation_status: !meetsVerification ? "pending" : null,
   });
 
-  triggerSmartRecording(cam);
+  // AUTO SMART RECORDING REMOVED — use manual Ctrl+W in LiveMonitor
+  // triggerSmartRecording(cam);
 }
 
 /**
@@ -3404,9 +3465,10 @@ async function createUnknownPersonFromFace(
     data: { person_id: newPerson.id, photo_path, is_primary: true, has_embedding: hasEmbedding },
   });
 
+  const countForUnknown = getEmbeddingCountForPerson(newPerson.id);
   await prisma.person.update({
     where: { id: newPerson.id },
-    data: { photo_path, embedding_count: hasEmbedding ? 1 : 0 },
+    data: { photo_path, embedding_count: countForUnknown },
   });
 
   const created = await prisma.person.findUnique({ where: { id: newPerson.id }, include: { photos: true } });
@@ -3472,13 +3534,18 @@ async function handleUnknownEvent(cam: any, frameBase64: string, face?: any) {
     person_category: personCategory,
     person_photo_path: personPhotoPath,
   });
-  triggerSmartRecording(cam);
+  // AUTO SMART RECORDING REMOVED — use manual Ctrl+W in LiveMonitor
+  // triggerSmartRecording(cam);
 }
 
 /** Детект → распознавание → обогащение кадра + (debounced) события в БД. */
 async function processDetectedFaces(cam: any, frameBase64: string, faces: any[]): Promise<any[]> {
   const lowT = low_threshold_pct / 100;
   const confirmT = confirmation_threshold_pct / 100;
+  const minFace = cam.min_face_size || 40;
+  const maxFace = cam.max_face_size || 0;
+  const frameW = 640;
+  const frameH = 480;
   const enriched: any[] = [];
   for (let i = 0; i < faces.length; i++) {
     const f = faces[i];
@@ -3488,6 +3555,10 @@ async function processDetectedFaces(cam: any, frameBase64: string, faces: any[])
     const w = box.width || 0;
     const h = box.height || 0;
     const bbox: [number, number, number, number] = [x, y, x + w, y + h];
+
+    if (h < minFace) continue;
+    if (maxFace > 0 && h > maxFace) continue;
+
     const desc = f.descriptor;
 
     // Ищем до НИЖНЕГО порога бэнда, чтобы поймать кандидатов 40-55% (подтверждение)
@@ -3619,7 +3690,8 @@ async function handleConfirmationEvent(cam: any, match: any, frameBase64: string
       existing_photo: existing_photo_path ? `/${existing_photo_path}` : null,
     });
 
-    triggerSmartRecording(cam);
+    // AUTO SMART RECORDING REMOVED — use manual Ctrl+W in LiveMonitor
+    // triggerSmartRecording(cam);
   } catch (e) {
     logError(e as Error, { context: "handleConfirmationEvent", personId });
   }
@@ -3952,9 +4024,10 @@ app.post(["/api/persons/reindex_all", "/api/persons/reindex_all/"], async (req, 
           if (result.hasEmbedding) registered++;
         }
 
+        const actualCount = getEmbeddingCountForPerson(person.id);
         await prisma.person.update({
           where: { id: person.id },
-          data: { embedding_count: registered },
+          data: { embedding_count: actualCount },
         });
 
         success.push(person.name);

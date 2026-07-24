@@ -39,6 +39,7 @@ export default function Events() {
   const [filterType, setFilterType] = useState('')
   const [showClearConfirm, setShowClearConfirm] = useState(false)
   const filterRef = useRef(filterType)
+  const [nextCursor, setNextCursor] = useState<number | null>(null)
   useEffect(() => { filterRef.current = filterType }, [filterType])
 
   const fetchEvents = async (silent = false) => {
@@ -46,8 +47,15 @@ export default function Events() {
     try {
       const params = new URLSearchParams({ limit: '200' })
       if (filterRef.current) params.set('event_type', filterRef.current)
-      const data = await apiFetch<KrakenEvent[]>(`/events?${params}`)
-      setEvents(data)
+      if (nextCursor) params.set('last_id', String(nextCursor))
+      const data = await apiFetch<{ events: KrakenEvent[]; next_cursor: number | null }>(`/events?${params}`)
+      setEvents(prev => {
+        const map = new Map<number, KrakenEvent>()
+        prev.forEach(e => map.set(e.id, e))
+        data.events.forEach(e => map.set(e.id, e))
+        return Array.from(map.values()).sort((a, b) => b.id - a.id)
+      })
+      setNextCursor(data.next_cursor)
     } catch (e) {
       console.error(e)
     } finally {

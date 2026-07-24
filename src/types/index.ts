@@ -63,6 +63,7 @@ export interface Camera {
   exclusion_zones?: RoiZone[] | null
   detection_threshold?: number | null
   min_face_size?: number | null
+  max_face_size?: number | null
   fps?: number | null
   ping_ms?: number | null
   is_smart_recording: boolean
