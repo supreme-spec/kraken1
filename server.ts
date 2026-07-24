@@ -2678,7 +2678,7 @@ function getFfmpegPath(): string {
 }
 
 /** Возвращает аргументы ffmpeg ДО спецификации выходного файла (всё, что идёт до -i уже включено). */
-function buildFfmpegInputArgs(cam: any): string[] {
+function buildFfmpegInputArgs(cam: any, transport: "tcp" | "udp" = "tcp"): string[] {
   const isUsb = cam.camera_type === "USB" || /^\d+$/.test((cam.source || "").trim());
   if (isUsb) {
     let inputSource = (cam.source || "").trim();
@@ -2689,7 +2689,7 @@ function buildFfmpegInputArgs(cam: any): string[] {
     }
     return ["-hide_banner", "-loglevel", "error", "-f", "dshow", "-i", `video=${inputSource}`];
   }
-  // RTSP / IP / Hikvision / UNV: подставляем сохранённые учётные данные в URL, если их нет в source
+
   let source = (cam.source || "").trim();
   if (cam.username && cam.password && source && !/:\/\/[^@]+@/.test(source)) {
     try {
@@ -2698,10 +2698,14 @@ function buildFfmpegInputArgs(cam: any): string[] {
       u.password = encodeURIComponent(cam.password);
       source = u.toString();
     } catch {
-      // не URL — оставляем как есть
+      // ignore invalid URL
     }
   }
-  // -hide_banner + -loglevel error: не засоряем логи баннером версии/конфигурации на каждом (пере)запуске
+
+  if (transport === "udp") {
+    return ["-hide_banner", "-loglevel", "error", "-rtsp_transport", "udp", "-i", source];
+  }
+
   return ["-hide_banner", "-loglevel", "error", "-rtsp_transport", "tcp", "-rtsp_flags", "prefer_tcp", "-timeout", "5000000", "-i", source];
 }
 
@@ -3363,6 +3367,9 @@ wssCamera.on("connection", (ws, req) => {
 const SOI = Buffer.from([0xFF, 0xD8]);
 const EOI = Buffer.from([0xFF, 0xD9]);
 
+// Fallback: камеры, на которых TCP уже падал с -138, след. попытка будет через UDP
+const cameraTransportFallback = new Map<number, "tcp" | "udp">();
+
 function getFallbackFrame(): string {
   const assetsDir = path.join(__dirname, process.env.NODE_ENV === "production" ? "../public/assets" : "public/assets");
   const rusSrc = path.join(assetsDir, "rus.jpg");
@@ -3372,11 +3379,12 @@ function getFallbackFrame(): string {
   return FALLBACK_JPEG;
 }
 
-function startCameraPipeline(cam: any, fallbackFrame: string) {
+function startCameraPipeline(cam: any, fallbackFrame: string, transportOverride?: "tcp" | "udp") {
   if (!cam.source) return;
 
+  const transport = transportOverride || cameraTransportFallback.get(cam.id) || "tcp";
   const args = [
-    ...buildFfmpegInputArgs(cam),
+    ...buildFfmpegInputArgs(cam, transport),
     "-f", "mjpeg",
     "-pix_fmt", "yuvj422p",
     "-q:v", "3",
@@ -3428,7 +3436,15 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
       }
     });
 
-    proc.stderr.on("data", (d) => logDebug(`FFmpeg (${cam.id}): ${d.toString().trim()}`));
+    proc.stderr.on("data", (d: Buffer) => {
+      const text = d.toString();
+      logDebug(`FFmpeg (${cam.id}): ${text.trim()}`);
+      // Если TCP упал с ошибкой -138 — помечаем камеру для fallback на UDP
+      if (text.includes("Error number -138") && transport === "tcp") {
+        cameraTransportFallback.set(cam.id, "udp");
+        logWarn(`Камера ${cam.id}: TCP транспорт недоступен (Error -138), следующая попытка через UDP`);
+      }
+    });
 
     proc.on("error", (err) => logError(`Ошибка FFmpeg для камеры ${cam.id}: ${err.message}`));
 
@@ -3458,8 +3474,9 @@ function startCameraPipeline(cam: any, fallbackFrame: string) {
         cameraRestartTimers.delete(cam.id);
         const latestCam = cameras.find(c => c.id === cam.id);
         const stillHasClients = (cameraStreams.get(cam.id)?.size ?? 0) > 0;
-        if (latestCam && latestCam.is_active && stillHasClients && !activeFfmpegProcesses.has(cam.id)) {
-          startCameraPipeline(latestCam, fallbackFrame);
+        if (latestCam && latestCam.is_active && stillHasClients && !activeFfmpegProcesses.has(latestCam.id)) {
+          const fallbackTransport = cameraTransportFallback.get(latestCam.id);
+          startCameraPipeline(latestCam, fallbackFrame, fallbackTransport);
         }
       }, delay);
       cameraRestartTimers.set(cam.id, restartTimer);
