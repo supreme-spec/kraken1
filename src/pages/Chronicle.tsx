@@ -95,7 +95,10 @@ export default function Chronicle() {
   const [dayData, setDayData]           = useState<DayData | null>(null)
   const [stats, setStats]               = useState<Stats | null>(null)
   const [loading, setLoading]           = useState(false)
-  const [lightbox, setLightbox]         = useState<Visitor | null>(null)
+  const [columns, setColumns]           = useState<number>(4)
+  const [drawerVisitor, setDrawerVisitor] = useState<Visitor | null>(null)
+  const [editingName, setEditingName]   = useState('')
+  const [savingName, setSavingName]     = useState(false)
   const [cleaning, setCleaning]         = useState(false)
   const [deletingPhoto, setDeletingPhoto] = useState<string | null>(null)
   const [showCleanModal, setShowCleanModal] = useState(false)
@@ -196,7 +199,7 @@ export default function Chronicle() {
             visitors: prev.visitors.filter(v => v.filename !== visitor.filename),
             count: prev.count - 1,
           } : null)
-          if (lightbox?.filename === visitor.filename) setLightbox(null)
+          if (drawerVisitor?.filename === visitor.filename) setDrawerVisitor(null)
         } catch (e: any) {
           setAlertState({ isOpen: true, title: 'Ошибка', message: 'Ошибка удаления: ' + e.message })
         } finally {
@@ -315,6 +318,10 @@ export default function Chronicle() {
           )}
         </div>
         <div className="flex items-center gap-2">
+          <div className="flex items-center bg-kraken-hover rounded-lg p-0.5 gap-0.5">
+            <button onClick={() => setColumns(2)} className={`px-2 py-1 rounded text-[10px] font-bold transition-colors ${columns === 2 ? 'bg-kraken-purple text-white' : 'text-kraken-muted hover:text-kraken-text'}`}>2</button>
+            <button onClick={() => setColumns(4)} className={`px-2 py-1 rounded text-[10px] font-bold transition-colors ${columns === 4 ? 'bg-kraken-purple text-white' : 'text-kraken-muted hover:text-kraken-text'}`}>4</button>
+          </div>
           <button onClick={loadCameras} className="btn-ghost flex items-center gap-1.5 text-xs py-1.5 px-3">
             <RefreshCw size={12} className={loading ? 'animate-spin' : ''} />
             Обновить
@@ -493,14 +500,14 @@ export default function Chronicle() {
                       <p className="text-sm">Нет посетителей за этот день</p>
                     </div>
                   ) : (
-                    <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3">
+                    <div className={`grid gap-3`} style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }}>
                       {dayData.visitors.map((v, i) => (
                         <div key={i}
                           className="group relative cursor-pointer rounded-xl overflow-hidden border border-kraken-border hover:border-kraken-purple transition-all duration-200 hover:shadow-glow-purple">
-                          <div className="aspect-square bg-kraken-hover" onClick={() => setLightbox(v)}>
+                          <div className="aspect-square bg-kraken-hover" onClick={() => setDrawerVisitor(v)}>
                             <ChronicleImage src={v.photo_url} alt={v.person_name} />
                           </div>
-                          <div className="px-2 py-1.5 bg-kraken-panel" onClick={() => setLightbox(v)}>
+                          <div className="px-2 py-1.5 bg-kraken-panel" onClick={() => setDrawerVisitor(v)}>
                             <div className="text-kraken-text text-xs font-medium truncate">{v.person_name}</div>
                             <div className="text-kraken-disabled text-[10px]">{v.time}</div>
                           </div>
@@ -544,24 +551,69 @@ export default function Chronicle() {
         </div>
       )}
 
-      {/* ── Лайтбокс ── */}
-      {lightbox && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80" onClick={() => setLightbox(null)}>
-          <div className="relative max-w-xl max-h-[90vh] mx-4 animate-fade-in" onClick={e => e.stopPropagation()}>
-            <img src={lightbox.photo_url} alt={lightbox.person_name}
-              className="max-w-full max-h-[85vh] rounded-xl shadow-2xl" />
-            <div className="absolute bottom-4 left-4 right-4 flex items-center justify-between">
-              <div className="text-white text-sm font-medium bg-black/50 px-3 py-1.5 rounded-lg">
-                {lightbox.person_name} · {lightbox.time} · {lightbox.size_kb} KB
+      {/* ── Drawer (справа 50%) ── */}
+      {drawerVisitor && (
+        <div className="fixed inset-0 z-50 flex">
+          <div className="absolute inset-0 bg-black/60" onClick={() => setDrawerVisitor(null)} />
+          <div className="relative ml-auto w-full max-w-[50vw] h-full bg-kraken-panel border-l border-kraken-border shadow-2xl animate-fade-in overflow-y-auto">
+            <div className="sticky top-0 z-10 flex items-center justify-between p-4 border-b border-kraken-border bg-kraken-panel/90 backdrop-blur-sm">
+              <div className="text-kraken-text text-sm font-semibold">Фото гостя</div>
+              <button onClick={() => setDrawerVisitor(null)} className="text-kraken-muted hover:text-kraken-text">
+                <X size={18} />
+              </button>
+            </div>
+            <div className="p-4 flex flex-col gap-4">
+              <div className="aspect-video bg-black rounded-xl overflow-hidden border border-kraken-border">
+                <img src={drawerVisitor.photo_url} alt={drawerVisitor.person_name} className="w-full h-full object-contain" />
+              </div>
+              <div className="flex flex-col gap-2">
+                <div>
+                  <label className="text-kraken-muted text-[10px] uppercase tracking-widest">Имя</label>
+                  {editingName === '__EDIT__' ? (
+                    <div className="flex gap-2 mt-1">
+                      <input
+                        type="text"
+                        value={drawerVisitor.person_name}
+                        onChange={e => setDrawerVisitor({ ...drawerVisitor, person_name: e.target.value })}
+                        className="flex-1 bg-kraken-hover border border-kraken-border text-kraken-text text-sm px-3 py-2 rounded-lg focus:outline-none focus:border-kraken-purple"
+                      />
+                      <button onClick={async () => {
+                        setSavingName(true)
+                        try {
+                          await apiFetch(`/persons/${drawerVisitor.person_id}`, {
+                            method: 'PUT',
+                            body: JSON.stringify({ name: drawerVisitor.person_name }),
+                          })
+                          setEditingName('')
+                          loadCameras()
+                        } catch (e: any) {
+                          alert('Ошибка сохранения: ' + e.message)
+                        } finally {
+                          setSavingName(false)
+                        }
+                      }} className="px-3 py-2 bg-kraken-purple text-white text-xs rounded-lg disabled:opacity-50">
+                        {savingName ? '...' : 'Сохранить'}
+                      </button>
+                      <button onClick={() => setEditingName('')} className="px-3 py-2 bg-kraken-hover text-kraken-muted text-xs rounded-lg">Отмена</button>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-2 mt-1">
+                      <div className="text-kraken-text text-sm font-medium">{drawerVisitor.person_name}</div>
+                      <button onClick={() => setEditingName('__EDIT__')} className="text-kraken-muted hover:text-kraken-purple text-xs">✎</button>
+                    </div>
+                  )}
+                </div>
+                <div className="text-kraken-muted text-xs">{drawerVisitor.time} · {drawerVisitor.size_kb} KB</div>
               </div>
               <div className="flex gap-2">
-                <a href={lightbox.photo_url} download={lightbox.filename}
-                  className="p-2 rounded-lg bg-black/50 text-white hover:bg-black/70 transition-colors" title="Скачать">
-                  <Download size={16} />
+                <a href={drawerVisitor.photo_url} download={drawerVisitor.filename} className="flex-1 flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-kraken-hover text-kraken-text text-xs hover:bg-kraken-border transition-colors">
+                  <Download size={14} /> Скачать
                 </a>
-                <button onClick={() => setLightbox(null)}
-                  className="p-2 rounded-lg bg-black/50 text-white hover:bg-kraken-red transition-colors" title="Закрыть">
-                  <X size={16} />
+                <button onClick={async () => {
+                  await handleDeletePhoto(drawerVisitor)
+                  setDrawerVisitor(null)
+                }} className="flex-1 flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-kraken-red/10 text-kraken-red text-xs hover:bg-kraken-red/20 transition-colors">
+                  <Trash2 size={14} /> Удалить
                 </button>
               </div>
             </div>
