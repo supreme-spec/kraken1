@@ -18,6 +18,14 @@ import math
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
+# ─── CPU Optimization for Intel i5-10400 ──────────────────────────────────────
+# Must be set BEFORE numpy/onnxruntime import
+_cpu_count = os.cpu_count() or 4
+if "OMP_NUM_THREADS" not in os.environ:
+    os.environ["OMP_NUM_THREADS"] = str(min(6, _cpu_count))
+if "ORT_NUM_THREADS" not in os.environ:
+    os.environ["ORT_NUM_THREADS"] = str(min(6, _cpu_count))
+
 import cv2
 import numpy as np
 import faiss
@@ -38,6 +46,8 @@ COOLDOWN_SECONDS: int = int(os.getenv("FACE_COOLDOWN_SECONDS", "30"))
 RECOGNITION_THRESHOLD: float = float(os.getenv("FACE_RECOGNITION_THRESHOLD", "45")) / 100
 CONFIRMATION_THRESHOLD: float = float(os.getenv("FACE_CONFIRMATION_THRESHOLD", "55")) / 100
 LOW_THRESHOLD: float = float(os.getenv("FACE_LOW_THRESHOLD", "40")) / 100
+
+INFERENCE_TIMEOUT_SECONDS: int = int(os.getenv("FACE_INFERENCE_TIMEOUT_SECONDS", "60"))
 # Пороги для ИЗВЛЕЧЕНИЯ ЭМБЕДДИНГА (регистрация/обучение) — максимально мягкие:
 # здесь мы ХОТИМ вытащить вектор даже из неидеального кадра (размытие/поворот/темнота).
 EMBED_MIN_DET_SCORE: float = float(os.getenv("FACE_EMBED_MIN_DET_SCORE", "0.35"))
@@ -615,6 +625,20 @@ async def get_health() -> Dict[str, Any]:
     }
 
 
+async def run_inference_with_timeout(name: str, func, *args, **kwargs):
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(func, *args, **kwargs),
+            timeout=INFERENCE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"Inference timeout: {name} exceeded {INFERENCE_TIMEOUT_SECONDS}s")
+        raise HTTPException(status_code=504, detail=f"{name} timeout")
+    except Exception as e:
+        logger.error(f"Inference error: {name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/detect-faces", dependencies=[Depends(verify_api_key)])
 async def detect_faces(
     image: UploadFile = File(...),
@@ -635,7 +659,7 @@ async def detect_faces(
             raise HTTPException(status_code=400, detail="Empty or invalid image")
 
         threshold = min_confidence if min_confidence is not None else MIN_DETECTION_SCORE
-        faces = face_app.get(img)
+        faces = await run_inference_with_timeout("detect_faces", face_app.get, img)
         results: List[Dict[str, Any]] = []
 
         for face in faces[:max_faces]:
@@ -699,7 +723,7 @@ async def assess_quality(image: UploadFile = File(...)):
                 "faces": [],
             }
 
-        faces = face_app.get(img)
+        faces = await run_inference_with_timeout("assess_quality", face_app.get, img)
         face_count = len(faces)
         valid_faces = [f for f in faces if passes_quality_gate(f)]
 
@@ -776,7 +800,7 @@ async def get_embedding(
         if img is None or img.size == 0:
             raise HTTPException(status_code=400, detail="Empty or invalid image")
 
-        faces = face_app.get(img)
+        faces = await run_inference_with_timeout("get_embedding", face_app.get, img)
         if not faces:
             return {"descriptor": None, "error": "No face detected", "quality": None, "issues": ["Лицо не обнаружено"]}
 
@@ -842,7 +866,7 @@ async def recognize(
         if img is None or img.size == 0:
             raise HTTPException(status_code=400, detail="Empty or invalid image")
 
-        faces = face_app.get(img)
+        faces = await run_inference_with_timeout("recognize", face_app.get, img)
         if not faces:
             return {"matches": [], "status": "no_faces"}
 

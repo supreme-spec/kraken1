@@ -26,6 +26,10 @@ const USE_PYTHON_SERVER = true;
 const HEALTH_CHECK_INTERVAL_MS = Number(process.env.FACE_HEALTH_CHECK_INTERVAL) || 10_000;
 const HEALTH_CHECK_TIMEOUT_MS = Number(process.env.FACE_HEALTH_CHECK_TIMEOUT) || 5_000;
 
+const FACE_REQUEST_TIMEOUT_MS = Number(process.env.FACE_REQUEST_TIMEOUT_MS) || 60_000;
+const FACE_REQUEST_RETRIES = Number(process.env.FACE_REQUEST_RETRIES) || 3;
+const FACE_RETRY_BASE_DELAY_MS = Number(process.env.FACE_RETRY_BASE_DELAY_MS) || 1000;
+
 // Embedding cache
 const EMBEDDING_CACHE_TTL_MS = Number(process.env.FACE_EMBEDDING_CACHE_TTL) || 5 * 60 * 1000; // 5 мин
 
@@ -578,7 +582,44 @@ function getApiHeaders(): Record<string, string> {
 
 async function apiFetchWithKey(input: string | URL, init: RequestInit = {}): Promise<any> {
   const headers = { ...(init.headers || {}), ...getApiHeaders() };
-  return fetch(input, { ...init, headers } as any);
+  let lastError: any;
+
+  for (let attempt = 0; attempt < FACE_REQUEST_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), FACE_REQUEST_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(input, {
+        ...init,
+        headers,
+        signal: controller.signal,
+      } as any);
+
+      clearTimeout(timeoutId);
+      return response;
+    } catch (err) {
+      clearTimeout(timeoutId);
+      lastError = err;
+
+      const isAbort = (err as Error)?.name === "AbortError";
+      const isNetwork = !(err as Error)?.message?.includes("Server responded with status");
+
+      if (attempt < FACE_REQUEST_RETRIES - 1 && (isAbort || isNetwork)) {
+        const delay = FACE_RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+        logWarn(`Face Engine request failed (attempt ${attempt + 1}/${FACE_REQUEST_RETRIES}), retrying in ${delay}ms`, {
+          input: String(input),
+          error: (err as Error).message,
+        });
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        continue;
+      }
+
+      break;
+    }
+  }
+
+  logError(lastError as Error, { context: "Face Engine API request failed", retries: FACE_REQUEST_RETRIES });
+  throw lastError;
 }
 
 /**

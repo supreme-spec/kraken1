@@ -58,6 +58,9 @@ const HOST = process.env.HOST || "0.0.0.0";
 // Если не задан — сервер работает открыто (dev), но выводит предупреждение.
 const API_KEY = process.env.API_KEY || "";
 
+const UNV_MAX_SNAPSHOT_WIDTH = parseInt(process.env.UNV_MAX_SNAPSHOT_WIDTH || "1280", 10);
+const UNV_MAX_SNAPSHOT_HEIGHT = parseInt(process.env.UNV_MAX_SNAPSHOT_HEIGHT || "720", 10);
+
 app.use(express.json());
 
 // Middleware для логирования запросов
@@ -342,7 +345,26 @@ function findNameAndSimilarity(obj: any): { name?: string, similarity?: number }
   return { name, similarity };
 }
 
-app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/api/cameras/unv/webhook", "/api/cameras/unv/webhook/"], upload.any(), (req, res) => {
+function downscaleSnapshot(filePath: string, maxWidth: number, maxHeight: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    sharp(filePath).metadata().then((metadata) => {
+      if (metadata.width && metadata.height && (metadata.width > maxWidth || metadata.height > maxHeight)) {
+        sharp(filePath)
+          .resize(maxWidth, maxHeight, { fit: "inside", withoutEnlargement: true })
+          .toFile(filePath + ".tmp")
+          .then(() => {
+            if (fs.existsSync(filePath + ".tmp")) fs.renameSync(filePath + ".tmp", filePath);
+            resolve();
+          })
+          .catch(() => resolve());
+      } else {
+        resolve();
+      }
+    }).catch(() => resolve());
+  });
+}
+
+app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/api/cameras/unv/webhook", "/api/cameras/unv/webhook/"], upload.any(), async (req, res) => {
   logDebug("UNV LAPI Webhook received", { headers: req.headers['content-type'], query: req.query, bodyKeys: Object.keys(req.body) });
   
   let cameraId = parseInt(req.query.camera_id as string || req.query.id as string || "");
@@ -432,6 +454,7 @@ app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/a
       fs.copyFileSync(file.path, targetPath);
       snapshot_path = `snapshots/${targetFilename}`;
       logInfo(`UNV snapshot saved: ${snapshot_path}`);
+      await downscaleSnapshot(targetPath, UNV_MAX_SNAPSHOT_WIDTH, UNV_MAX_SNAPSHOT_HEIGHT);
     } catch (err) {
       logError(err as Error, { context: "UNV snapshot copy" });
     }
@@ -452,6 +475,7 @@ app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/a
         fs.writeFileSync(targetPath, Buffer.from(base64Data, 'base64'));
         snapshot_path = `snapshots/${targetFilename}`;
         logInfo(`UNV base64 snapshot saved: ${snapshot_path}`);
+        await downscaleSnapshot(targetPath, UNV_MAX_SNAPSHOT_WIDTH, UNV_MAX_SNAPSHOT_HEIGHT);
       } catch (err) {
         logError(err as Error, { context: "UNV base64 snapshot" });
       }
@@ -547,12 +571,14 @@ app.post(["/api/cameras/:id/test-connection", "/api/cameras/:id/test-connection/
   const cam = cameras.find((c) => c.id === id);
   if (cam) {
     if (cam.camera_type === "UNV") {
+      const maxW = UNV_MAX_SNAPSHOT_WIDTH;
+      const maxH = UNV_MAX_SNAPSHOT_HEIGHT;
       res.json({
         connected: true,
         brand: "Uniview",
-        model: "IPC3238EA LAPI (Face Recognition Series)",
-        driver_type: "UNV LAPI Push Webhook / Готово к получению Face Push. Укажите адрес: http://ваш-сервер:3000/api/cameras/unv/notification?camera_id=" + cam.id,
-        resolution: "3840x2160 (4K UHD)",
+        model: "IPC3238EA-AHDZK-I1 (Face Recognition Series)",
+        driver_type: "UNV LAPI Push Webhook / Готов к получению Face Push. Укажите адрес: http://ваш-сервер:3000/api/cameras/unv/notification?camera_id=" + cam.id,
+        resolution: `${maxW}x${maxH}`,
         codec: "H.265 / Smart Face Stream",
         status_info: "Ожидание HTTP POST от камеры. Канал связи активен."
       });
@@ -1898,35 +1924,47 @@ app.get("/api/health", async (req, res) => {
   // Запросим статус у Python-сервера
   try {
     const fetch = (await import('node-fetch')).default;
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 2000);
-    const response = await fetch('http://localhost:8001/status', { signal: controller.signal });
-    clearTimeout(timeoutId);
-    if (response.ok) {
-      const pythonStatus = await response.json() as any;
-      const provider = pythonStatus.provider || "CPUExecutionProvider";
-      recognition_provider = `onnxruntime (${provider})`;
-      
-      if (provider !== "CPUExecutionProvider") {
-        gpu_available = true;
-        gpu_detected = true;
-        if (provider.includes("CUDA")) {
-          gpu_name = "NVIDIA GPU";
-          gpu_vendor = "NVIDIA";
-        } else if (provider.includes("Dml")) {
-          gpu_name = "DirectX GPU";
-          gpu_vendor = "DirectML";
-        } else if (provider.includes("OpenVINO")) {
-          gpu_name = "Intel GPU/CPU";
-          gpu_vendor = "Intel";
-        } else if (provider.includes("ROCM")) {
-          gpu_name = "AMD GPU";
-          gpu_vendor = "AMD";
+    let lastError: any;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
+      try {
+        const response = await fetch('http://localhost:8001/status', { signal: controller.signal });
+        clearTimeout(timeoutId);
+        if (response.ok) {
+          const pythonStatus = await response.json() as any;
+          const provider = pythonStatus.provider || "CPUExecutionProvider";
+          recognition_provider = `onnxruntime (${provider})`;
+
+          if (provider !== "CPUExecutionProvider") {
+            gpu_available = true;
+            gpu_detected = true;
+            if (provider.includes("CUDA")) {
+              gpu_name = "NVIDIA GPU";
+              gpu_vendor = "NVIDIA";
+            } else if (provider.includes("Dml")) {
+              gpu_name = "DirectX GPU";
+              gpu_vendor = "DirectML";
+            } else if (provider.includes("OpenVINO")) {
+              gpu_name = "Intel GPU/CPU";
+              gpu_vendor = "Intel";
+            } else if (provider.includes("ROCM")) {
+              gpu_name = "AMD GPU";
+              gpu_vendor = "AMD";
+            }
+            gpu_providers = [provider, "CPUExecutionProvider"];
+            setup_recommendation = `Ускорение через ${provider} активно`;
+          } else {
+            setup_recommendation = "Python-сервер работает в CPU-режиме";
+          }
         }
-        gpu_providers = [provider, "CPUExecutionProvider"];
-        setup_recommendation = `Ускорение через ${provider} активно`;
-      } else {
-        setup_recommendation = "Python-сервер работает в CPU-режиме";
+        break;
+      } catch (err) {
+        clearTimeout(timeoutId);
+        lastError = err;
+        if (attempt < 2) {
+          await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+        }
       }
     }
   } catch (e) {
@@ -3477,7 +3515,7 @@ app.post(["/api/settings/setup/rerun", "/api/settings/setup/rerun/"], async (req
   try {
     // Форсируем health check Python-сервера и перечитываем GPU статус
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 3000);
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
     let gpuProvider = "CPUExecutionProvider";
     try {
       const r = await (await import("node-fetch")).default(
