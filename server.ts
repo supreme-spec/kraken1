@@ -16,6 +16,9 @@ import * as unzipper from "unzipper";
 import ExcelJS from "exceljs";
 import PDFDocument from "pdfkit";
 import AdmZip from "adm-zip";
+import iconv from "iconv-lite";
+import axios from "axios";
+import { XMLParser } from "fast-xml-parser";
 import {
   initFaceEngine,
   initFaceEngineWithDB,
@@ -156,7 +159,7 @@ const upload = multer({
   storage,
   limits: {
     fileSize: 10 * 1024 * 1024, // 10 МБ
-    files: 50,
+    files: 500,
   },
   fileFilter: (req, file, cb) => {
     if (ALLOWED_IMAGE_MIME.has(file.mimetype)) {
@@ -166,6 +169,59 @@ const upload = multer({
     }
   },
 });
+
+// ── Утилиты нормализации и кодировки (для импорта людей) ──
+
+function fixDoubleEncodedCyrillic(value: string): string {
+  if (typeof value !== 'string' || !value) return value;
+  if (/[а-яА-ЯёЁ]/.test(value)) return value;
+
+  try {
+    const decoded = iconv.decode(Buffer.from(value, 'latin1'), 'utf8');
+    if (decoded && /[а-яА-ЯёЁ]/.test(decoded)) return decoded;
+  } catch {}
+
+  return value;
+}
+
+function normalizePersonName(name: string): string {
+  if (!name) return name;
+  name = name.replace(/\s*\([^\)]*\)\s*/g, ' ').trim();
+  let normalized = name.replace(/\s+/g, ' ').trim().replace(/^[\s\-_]+|[\s\-_]+$/g, '');
+
+  return normalized.split(' ').map(w => {
+    if (!w || /^\d+$/.test(w)) return w;
+    if (w.includes('-')) {
+      return w.split('-').map(p => /^\d+$/.test(p) ? p : p.charAt(0).toUpperCase() + p.slice(1).toLowerCase()).join('-');
+    }
+    return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
+  }).join(' ');
+}
+
+function normalizePositionName(pos: string): string {
+  if (!pos) return pos;
+  pos = pos.replace(/\s*\([^\)]*\)\s*/g, ' ').trim();
+  const words = pos.replace(/\s+/g, ' ').trim().split(' ').filter(w => w);
+  if (words.length === 0) return pos;
+
+  return words.map((w, i) => {
+    if (!w || /^\d+$/.test(w)) return w;
+    return i === 0 ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : w.toLowerCase();
+  }).join(' ');
+}
+
+function getDuplicateKey(name: string): string {
+  return name ? name.replace(/\s+/g, '').toLowerCase() : '';
+}
+
+function fixFilesEncoding(files: Express.Multer.File[]): void {
+  if (!files || !Array.isArray(files)) return;
+  for (const file of files) {
+    if (file && typeof file.originalname === 'string') {
+      file.originalname = fixDoubleEncodedCyrillic(file.originalname);
+    }
+  }
+}
 
 // ── STATEFUL IN-MEMORY DATABASES ──
 // NOTE: cameras и persons используются как кэш из Prisma (синхронизируются при старте и мутациях).
@@ -320,6 +376,52 @@ app.post(["/api/cameras/:id/stop", "/api/cameras/:id/stop/"], async (req, res) =
     res.json({ success: true, status: "offline", camera: sanitizeCamera(updated) });
   } catch (err) {
     res.status(404).json({ detail: "Camera not found" });
+  }
+});
+
+app.post(["/api/cameras/:id/restart", "/api/cameras/:id/restart/"], async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const cam = cameras.find((c) => c.id === id);
+    if (!cam) return res.status(404).json({ detail: "Camera not found" });
+
+    logWarn(`[API] Принудительный перезапуск камеры ${id} (${cam.name})`);
+
+    // 1. Останавливаем текущий пайплайн (убиваем FFmpeg, чистим таймеры)
+    stopCameraPipeline(id);
+
+    // 2. Сбрасываем backoff-счётчик, чтобы не ждать экспоненциальную задержку
+    cameraFfmpegRetries.delete(id);
+
+    // 3. Не сбрасываем transportFallback — если TCP уже падал,
+    //    при перезапуске через API нужно сохранить выбор транспорта.
+    //    Если нужно принудительно переключить — фронтенд может передать query-параметр.
+    const forceTransport = req.query.transport as "tcp" | "udp" | undefined;
+    if (forceTransport === "tcp" || forceTransport === "udp") {
+      cameraTransportFallback.set(id, forceTransport);
+      logInfo(`[API] Камера ${id}: принудительный транспорт ${forceTransport}`);
+    }
+
+    // 4. Запускаем заново — он прочитает актуальное состояние fallback
+    const assetsDir = path.join(__dirname, process.env.NODE_ENV === "production" ? "../public/assets" : "public/assets");
+    const rusSrc = path.join(assetsDir, "rus.jpg");
+    const logoSrc = path.join(assetsDir, "logo.jpg");
+    let fallbackFrame: string;
+    if (fs.existsSync(rusSrc)) fallbackFrame = fs.readFileSync(rusSrc).toString("base64");
+    else if (fs.existsSync(logoSrc)) fallbackFrame = fs.readFileSync(logoSrc).toString("base64");
+    else fallbackFrame = FALLBACK_JPEG;
+
+    const transport = cameraTransportFallback.get(id) || "tcp";
+    startCameraPipeline(cam, fallbackFrame, transport);
+
+    res.json({
+      success: true,
+      message: `Pipeline камеры ${id} перезапущен`,
+      currentFallback: cameraTransportFallback.get(id) || "tcp",
+    });
+  } catch (err: any) {
+    logError(err as Error, { context: "camera restart API", cameraId: req.params.id });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -575,6 +677,151 @@ app.post(["/api/cameras/unv/notification", "/api/cameras/unv/notification/", "/a
 
   res.json({ success: true, camera_id: camera.id, processed: true });
 });
+
+app.post(
+  ["/webhooks/camera", "/webhooks/camera/"],
+  express.text({ type: ["application/xml", "application/json", "text/plain"] }),
+  async (req, res) => {
+    try {
+      const clientIp = (req.ip || req.socket.remoteAddress || "").replace(/^::ffff:/i, "");
+
+      const now = Date.now();
+      const lastTime = webhookCooldown.get(clientIp) || 0;
+      if (now - lastTime < 2000) {
+        return res.status(200).send("OK");
+      }
+
+      const payload = typeof req.body === "string" ? req.body.toLowerCase() : JSON.stringify(req.body).toLowerCase();
+      const isTrigger = ["face", "human", "vmd", "regionentrance", "linedetection", "intelligent", "alarm", "motion"].some((keyword) => payload.includes(keyword));
+      
+      if (!isTrigger) {
+        return res.status(200).send("OK");
+      }
+
+      const camera = cameras.find((c) => c.ip_address === clientIp);
+      if (!camera) {
+        logInfo(`[Webhook] Алерт от неизвестной камеры IP: ${clientIp}`);
+        return res.status(200).send("OK");
+      }
+
+      webhookCooldown.set(clientIp, now);
+      logInfo(`📸 [Webhook] Событие детекции от ${camera.name} (${clientIp})`);
+
+      res.status(200).send("OK"); 
+      
+      processCameraEventInBackground(camera).catch((err) => {
+        logError(err as Error, { context: "Background camera processing", cameraId: camera.id });
+      });
+
+    } catch (err) {
+      logError(err as Error, { context: "Webhook endpoint crash" });
+      res.status(200).send("OK");
+    }
+  }
+);
+
+const webhookCooldown = new Map<string, number>();
+
+async function fetchCameraSnapshot(camera: any): Promise<Buffer | null> {
+  const brand = (camera.camera_type || "").toLowerCase().includes("unv") ? "uniview" : "hikvision";
+  const snapshotPath = brand === "uniview" ? "/images/snapshot.jpg" : "/ISAPI/Streaming/channels/101/picture";
+  const auth = camera.username && camera.password ? { username: camera.username, password: camera.password } : undefined;
+  const url = `http://${camera.ip_address}${snapshotPath}`;
+
+  try {
+    const response = await axios.get(url, { 
+      responseType: "arraybuffer", 
+      auth, 
+      timeout: 3000,
+      maxRedirects: 0 
+    });
+    
+    const buffer = Buffer.from(response.data);
+    if (buffer.length > 2 && buffer[0] === 0xff && buffer[1] === 0xd8) {
+      return buffer;
+    }
+    logInfo(`[Snapshot] Неверный формат данных от ${camera.ip_address}`);
+  } catch (err: any) {
+    logInfo(`[Snapshot] Не удалось получить снимок с ${camera.ip_address}: ${err.message}`);
+  }
+  return null;
+}
+
+async function processCameraEventInBackground(camera: any) {
+  try {
+    const snapshotBuffer = await fetchCameraSnapshot(camera);
+    if (!snapshotBuffer) {
+      logInfo(`[Background] Пропуск: не удалось получить снимок с ${camera.name}`);
+      return;
+    }
+
+    const FormDataCtor = (globalThis as any).FormData || (await import('form-data')).default;
+    const form = new FormDataCtor();
+    form.append("image", snapshotBuffer, { filename: "snapshot.jpg", contentType: "image/jpeg" });
+    form.append("camera_id", String(camera.id));
+    
+    if (camera.detection_threshold) form.append("threshold", String(camera.detection_threshold));
+    if (camera.min_face_size) form.append("min_face_size", String(camera.min_face_size));
+    if (camera.passage_roi_x_min != null) form.append("passage_roi_x_min", String(camera.passage_roi_x_min));
+    if (camera.passage_roi_x_max != null) form.append("passage_roi_x_max", String(camera.passage_roi_x_max));
+    if (camera.passage_roi_y_min != null) form.append("passage_roi_y_min", String(camera.passage_roi_y_min));
+    if (camera.passage_roi_y_max != null) form.append("passage_roi_y_max", String(camera.passage_roi_y_max));
+    if (camera.guard_ignore_x_max != null) form.append("guard_ignore_x_max", String(camera.guard_ignore_x_max));
+
+    const faceServerUrl = process.env.FACE_SERVER_URL || "http://localhost:8001";
+    const recognitionRes = await axios.post(`${faceServerUrl}/recognize`, form, {
+      headers: typeof form.getHeaders === "function" ? form.getHeaders() : { "Content-Type": "multipart/form-data" },
+      timeout: 5000,
+    });
+
+    const result: any = recognitionRes.data;
+
+    if (result.status === "ok" && result.matches && result.matches.length > 0) {
+      const bestMatch = result.matches[0];
+      const threshold = camera.detection_threshold || 0.65;
+      if (bestMatch.similarity >= threshold) {
+        logInfo(`✅ РАСПОЗНАН: ${bestMatch.person_name} (${(bestMatch.similarity * 100).toFixed(1)}%) на камере "${camera.name}"`);
+
+        const targetFilename = `${Date.now()}_${Math.floor(Math.random() * 10000)}.jpg`;
+        const snapshotsDir = path.join(publicDir, "snapshots");
+        if (!fs.existsSync(snapshotsDir)) fs.mkdirSync(snapshotsDir, { recursive: true });
+        
+        const targetPath = path.join(snapshotsDir, targetFilename);
+        await fs.promises.writeFile(targetPath, snapshotBuffer);
+        const savedSnapshotPath = `snapshots/${targetFilename}`;
+
+        await prisma.event.create({
+          data: {
+            camera_id: camera.id,
+            camera_name: camera.name,
+            person_id: bestMatch.person_id,
+            event_type: "RECOGNITION",
+            confidence: bestMatch.similarity,
+            snapshot_path: savedSnapshotPath,
+            person_name: bestMatch.person_name,
+            person_category: "CLIENT",
+            created_at: new Date(),
+          }
+        });
+
+        await prisma.person.update({
+          where: { id: bestMatch.person_id },
+          data: { 
+            visit_count: { increment: 1 },
+            last_seen_at: new Date()
+          }
+        });
+      } else {
+        logInfo(`⚠️ СОВПАДЕНИЕ НИЖЕ ПОРОГА: ${bestMatch.person_name} (${(bestMatch.similarity * 100).toFixed(1)}% < ${(threshold * 100).toFixed(1)}%) на "${camera.name}"`);
+      }
+    } else {
+      logInfo(`🔍 НЕИЗВЕСТНЫЙ: Лицо обнаружено на "${camera.name}", но не найдено в базе.`);
+    }
+
+  } catch (err: any) {
+    logError(err, { context: "Background recognition processing", cameraId: camera.id });
+  }
+}
 
 app.post(["/api/cameras/:id/test-connection", "/api/cameras/:id/test-connection/"], (req, res) => {
   const id = parseInt(req.params.id);
@@ -1094,28 +1341,50 @@ app.post(["/api/persons", "/api/persons/"], upload.any(), async (req, res) => {
     if (req.file) files.push(req.file);
     if (req.files && Array.isArray(req.files)) files = files.concat(req.files as Express.Multer.File[]);
 
-    let name = req.body.name || "Новый посетитель";
-    let position = req.body.position || null;
+    fixFilesEncoding(files);
+    if (req.body && typeof req.body === 'object') {
+      for (const key of Object.keys(req.body)) {
+        if (typeof req.body[key] === 'string') {
+          req.body[key] = fixDoubleEncodedCyrillic(req.body[key]);
+        }
+      }
+    }
+
+    let name = normalizePersonName(req.body.name || "Новый посетитель");
+    let position = req.body.position ? normalizePositionName(req.body.position) : null;
 
     if (files.length > 0 && (!req.body.name || req.body.name === "Новый посетитель" || req.body.name === "Новый человек")) {
       const originalName = files[0].originalname;
       const ext = path.extname(originalName);
-      const baseName = path.basename(originalName, ext).trim();
-      const normalized = baseName.replace(/_/g, ' ').replace(/\s+/g, ' ');
-      const words = normalized.split(' ');
+      const baseName = path.basename(originalName, ext).trim().replace(/\_/g, ' ').replace(/\s+/g, ' ');
+      const words = baseName.split(' ').filter(w => w);
 
       if (words.length >= 4) {
-        name = words.slice(0, 3).join(' ');
-        position = words.slice(3).join(' ');
-      } else if (words.length === 3) {
-        name = words.slice(0, 2).join(' ');
-        position = words[2];
+        name = normalizePersonName(words.slice(0, 3).join(' '));
+        position = normalizePositionName(words.slice(3).join(' '));
       } else {
-        name = normalized;
+        name = normalizePersonName(baseName);
       }
     }
 
-    const category = req.body.category || "CLIENT";
+    const dupKey = getDuplicateKey(name);
+    const category = (req.body.category || "CLIENT").toUpperCase();
+
+    const existingPersons = await prisma.person.findMany({
+      where: { category },
+      select: { id: true, name: true, category: true, photos: true }
+    });
+    const existingMatch = existingPersons.find((p: any) => getDuplicateKey(p.name) === dupKey);
+
+    if (existingMatch) {
+      return res.status(409).json({
+        detail: "Дубликат",
+        person_id: existingMatch.id,
+        person_name: existingMatch.name,
+        message: `Уже существует: "${existingMatch.name}"`
+      });
+    }
+
     const photosList = [];
     let embedding_count = 0;
 
@@ -1246,6 +1515,15 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
     files = files.concat(req.files as Express.Multer.File[]);
   }
 
+  fixFilesEncoding(files);
+  if (req.body && typeof req.body === 'object') {
+    for (const key of Object.keys(req.body)) {
+      if (typeof req.body[key] === 'string') {
+        req.body[key] = fixDoubleEncodedCyrillic(req.body[key]);
+      }
+    }
+  }
+
   const category = (req.body.category || 'CLIENT').toUpperCase();
   const jobId = `job_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
 
@@ -1263,89 +1541,71 @@ app.post(["/api/persons/bulk_import", "/api/persons/bulk_import/"], upload.any()
     if (!job) return;
     job.status = 'processing';
 
+    const existingAll = await prisma.person.findMany({
+      where: { category },
+      select: { id: true, name: true, category: true, position: true, photos: true }
+    });
+
     for (let index = 0; index < files.length; index++) {
       const f = files[index];
       try {
-        const originalName = f.originalname;
-        const ext = path.extname(originalName);
-        const baseName = path.basename(originalName, ext);
+        const baseName = path.basename(f.originalname, path.extname(f.originalname));
+        const lastDashIdx = baseName.lastIndexOf('-');
+        let rawName = lastDashIdx > 0 ? baseName.substring(0, lastDashIdx).trim() : baseName;
+        let rawPosition = lastDashIdx > 0 ? baseName.substring(lastDashIdx + 1).trim() : null;
 
-        let rawName = baseName;
-        let rawPosition: string | null = null;
-        if (baseName.includes('-')) {
-          const parts = baseName.split('-');
-          rawName = parts[0].trim();
-          rawPosition = parts.slice(1).join('-').trim();
-        }
-
-        const formattedName = rawName.replace(/_/g, ' ').trim();
-        let name = formattedName || "Новый посетитель";
-        if (name === name.toUpperCase() || name === name.toLowerCase()) {
-          name = name.split(/\s+/).map(w => w ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : '').join(' ');
-        }
-        const cleanName = name.replace(/\s+\d+$/, '').replace(/\s*\(\d+\)$/, '').trim();
-
-        let position: string | null = null;
-        if (rawPosition) {
-          position = rawPosition.replace(/_/g, ' ').trim();
-          if (position === position.toUpperCase() || position === position.toLowerCase()) {
-            position = position.split(/\s+/).map(w => w ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : '').join(' ');
-          }
-        }
-
+        const name = normalizePersonName(rawName.replace(/\_/g, ' ').trim()) || "Новый посетитель";
+        const position = rawPosition ? normalizePositionName(rawPosition.replace(/\_/g, ' ').trim()) : null;
         const photo_path = `photos/${f.filename}`;
         const fullPath = path.join(publicDir, photo_path);
+        const dupKey = getDuplicateKey(name);
+        const existingPerson = existingAll.find((p: any) => getDuplicateKey(p.name) === dupKey) || null;
 
-        // Ищем существующую персону в БД (case-insensitive для SQLite)
-        const existingPersons = await prisma.person.findMany({
-          where: { name: { equals: cleanName } },
-          include: { photos: true },
-          take: 1,
-        });
-        // Fallback: toLowerCase match если Prisma не нашла точное совпадение
-        const existingPerson = existingPersons[0]
-          ?? (await prisma.person.findMany({ include: { photos: true } }))
-              .find((p: any) => p.name.toLowerCase() === cleanName.toLowerCase())
-          ?? null;
-
-        let personId: number;
         if (existingPerson) {
-          personId = existingPerson.id;
-          const regResult = await enrollPhotoWithGate(personId, cleanName, category, photo_path, fullPath);
+          const regResult = await enrollPhotoWithGate(existingPerson.id, name, category, photo_path, fullPath);
           const isPrimary = existingPerson.photos.length === 0;
           await prisma.personPhoto.create({
-            data: { person_id: personId, photo_path, is_primary: isPrimary, has_embedding: regResult.hasEmbedding },
+            data: { person_id: existingPerson.id, photo_path, is_primary: isPrimary, has_embedding: regResult.hasEmbedding },
           });
           if (regResult.hasEmbedding) {
-            await prisma.person.update({ where: { id: personId }, data: { embedding_count: { increment: 1 } } });
+            await prisma.person.update({ where: { id: existingPerson.id }, data: { embedding_count: { increment: 1 } } });
           }
           if (isPrimary) {
-            await prisma.person.update({ where: { id: personId }, data: { photo_path } });
+            await prisma.person.update({ where: { id: existingPerson.id }, data: { photo_path } });
           }
-          job.created.push({ name: cleanName, position: existingPerson.position, embeddings: regResult.hasEmbedding ? 1 : 0 });
+          job.created.push({ name, position: existingPerson.position, embeddings: regResult.hasEmbedding ? 1 : 0, photos: 1, photos_without_embedding: regResult.hasEmbedding ? 0 : 1 });
         } else {
           const newPerson = await prisma.person.create({
-            data: { name: cleanName, category, position, is_active: true, visit_count: 0, embedding_count: 0 },
+            data: { name, category, position, is_active: true, visit_count: 0, embedding_count: 0 },
           });
-          personId = newPerson.id;
-          const regResult = await enrollPhotoWithGate(personId, cleanName, category, photo_path, fullPath);
+          const regResult = await enrollPhotoWithGate(newPerson.id, name, category, photo_path, fullPath);
           await prisma.personPhoto.create({
-            data: { person_id: personId, photo_path, is_primary: true, has_embedding: regResult.hasEmbedding },
+            data: { person_id: newPerson.id, photo_path, is_primary: true, has_embedding: regResult.hasEmbedding },
           });
           await prisma.person.update({
-            where: { id: personId },
+            where: { id: newPerson.id },
             data: { photo_path, embedding_count: regResult.hasEmbedding ? 1 : 0 },
           });
-          // Sync in-memory
-          const created = await prisma.person.findUnique({ where: { id: personId }, include: { photos: true } });
+          const created = await prisma.person.findUnique({ where: { id: newPerson.id }, include: { photos: true } });
           if (created) persons.unshift({ ...created });
-          job.created.push({ name: cleanName, position, embeddings: regResult.hasEmbedding ? 1 : 0 });
+          existingAll.push(created);
+          job.created.push({ name, position, embeddings: regResult.hasEmbedding ? 1 : 0, photos: 1, photos_without_embedding: regResult.hasEmbedding ? 0 : 1 });
         }
       } catch (err: any) {
         job.failed.push({ file: f.originalname, error: err.message || 'Ошибка обработки' });
       }
       job.progress = index + 1;
     }
+
+    const aggregated: Record<string, any> = {};
+    for (const c of job.created) {
+      const key = `${c.name}__${c.position ?? ''}`;
+      if (!aggregated[key]) aggregated[key] = { name: c.name, position: c.position ?? null, embeddings: 0, photos: 0, photos_without_embedding: 0 };
+      aggregated[key].embeddings += c.embeddings;
+      aggregated[key].photos += c.photos;
+      aggregated[key].photos_without_embedding += c.photos_without_embedding;
+    }
+    job.created = Object.values(aggregated);
     job.status = 'done';
   }, 100);
 
@@ -2691,6 +2951,18 @@ function buildFfmpegInputArgs(cam: any, transport: "tcp" | "udp" = "tcp"): strin
   }
 
   let source = (cam.source || "").trim();
+
+  if (/^rtsp:\/\//i.test(source)) {
+    try {
+      const u = new URL(source);
+      u.searchParams.delete("tcp_transport");
+      u.searchParams.delete("rtsp_transport");
+      source = u.toString();
+    } catch {
+      // ignore invalid URL
+    }
+  }
+
   if (cam.username && cam.password && source && !/:\/\/[^@]+@/.test(source)) {
     try {
       const u = new URL(source);
@@ -2702,11 +2974,13 @@ function buildFfmpegInputArgs(cam: any, transport: "tcp" | "udp" = "tcp"): strin
     }
   }
 
-  if (transport === "udp") {
-    return ["-hide_banner", "-loglevel", "error", "-rtsp_transport", "udp", "-i", source];
-  }
+  const args =
+    transport === "udp"
+      ? ["-hide_banner", "-loglevel", "error", "-rtsp_transport", "udp", "-i", source]
+      : ["-hide_banner", "-loglevel", "error", "-rtsp_transport", "tcp", "-rtsp_flags", "prefer_tcp", "-timeout", "5000000", "-i", source];
 
-  return ["-hide_banner", "-loglevel", "error", "-rtsp_transport", "tcp", "-rtsp_flags", "prefer_tcp", "-timeout", "5000000", "-i", source];
+  logDebug(`buildFfmpegInputArgs camera=${cam.id} transport=${transport} source=${source}`);
+  return args;
 }
 
 // Активные записи видео: cameraId -> сессия
@@ -3395,6 +3669,8 @@ function startCameraPipeline(cam: any, fallbackFrame: string, transportOverride?
 
   try {
     const ffmpegPath = getFfmpegPath();
+    logInfo(`🚀 [Camera ${cam.id}] ЗАПУСК FFmpeg. Аргументы: [${args.join(", ")}]`);
+    logDebug(`[Camera ${cam.id}] Полная команда: ffmpeg ${args.join(" ")}`);
     const proc = spawn(ffmpegPath, args);
     activeFfmpegProcesses.set(cam.id, proc);
     logInfo(`FFmpeg запущен для камеры ${cam.id} (${cam.name})`, { source: cam.source, path: ffmpegPath });

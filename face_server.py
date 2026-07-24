@@ -52,6 +52,8 @@ INFERENCE_TIMEOUT_SECONDS: int = int(os.getenv("FACE_INFERENCE_TIMEOUT_SECONDS",
 # здесь мы ХОТИМ вытащить вектор даже из неидеального кадра (размытие/поворот/темнота).
 EMBED_MIN_DET_SCORE: float = float(os.getenv("FACE_EMBED_MIN_DET_SCORE", "0.35"))
 EMBED_MIN_FACE_SIZE: int = int(os.getenv("FACE_EMBED_MIN_FACE_SIZE", "28"))
+# Максимальный размер лица для детекции (0 = отключено).
+MAX_FACE_SIZE: int = int(os.getenv("FACE_MAX_FACE_SIZE", "0"))
 
 # ── ПОРОГИ КАЧЕСТВА ДЛЯ ВОРОТ (ENROLLMENT GATE) ───────────────────────────────
 # Жёсткие пороги при ЗАПИСИ РЕФЕРЕНСНОГО эмбеддинга. Мусорные кадры (размытие,
@@ -76,6 +78,38 @@ DB_PATH: str = os.getenv("DB_PATH", "prisma/dev.db")
 
 logging.basicConfig(level=logging.INFO, format="[FaceEngine] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+# ─── Zone filters (fraction of frame width/height) ─────────────────────────────
+# Passage ROI where the guest should appear.
+PASSAGE_ROI = {
+    "x_min": 0.30,
+    "x_max": 0.65,
+    "y_min": 0.10,
+    "y_max": 0.80,
+}
+# Left-side ignore zone where the guard stands.
+GUARD_IGNORE_ZONE = {
+    "x_min": 0.00,
+    "x_max": 0.30,
+    "y_min": 0.00,
+    "y_max": 1.00,
+}
+
+def is_valid_face_position(face_bbox, frame_width: int, frame_height: int) -> bool:
+    x1, y1, x2, y2 = [int(v) for v in face_bbox[:4]]
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    nx = cx / max(1, frame_width)
+    ny = cy / max(1, frame_height)
+    in_passage = (
+        PASSAGE_ROI["x_min"] <= nx <= PASSAGE_ROI["x_max"]
+        and PASSAGE_ROI["y_min"] <= ny <= PASSAGE_ROI["y_max"]
+    )
+    in_guard = (
+        GUARD_IGNORE_ZONE["x_min"] <= nx <= GUARD_IGNORE_ZONE["x_max"]
+        and GUARD_IGNORE_ZONE["y_min"] <= ny <= GUARD_IGNORE_ZONE["y_max"]
+    )
+    return in_passage and not in_guard
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 
@@ -356,22 +390,29 @@ def load_image_from_bytes(data: bytes) -> Optional[np.ndarray]:
 
 # ─── Quality Gate ─────────────────────────────────────────────────────────────
 
-def passes_quality_gate(face: Any) -> bool:
+def passes_quality_gate(face: Any, strict: bool = False) -> bool:
     """
     Filters low-quality detections before embedding extraction.
     Rejects:
-      - det_score < MIN_DETECTION_SCORE
-      - face width < MIN_FACE_SIZE
+      - det_score < MIN_DETECTION_SCORE (live) or < EMBED_MIN_DET_SCORE (enrollment)
+      - face width < MIN_FACE_SIZE (live) or < EMBED_MIN_FACE_SIZE (enrollment)
+      - face width > MAX_FACE_SIZE (when enabled)
     """
     score = float(face.det_score) if hasattr(face, "det_score") else 0.0
-    if score < MIN_DETECTION_SCORE:
-        logger.debug(f"Quality gate: score {score:.3f} < {MIN_DETECTION_SCORE}")
+    min_score = EMBED_MIN_DET_SCORE if strict else MIN_DETECTION_SCORE
+    if score < min_score:
+        logger.debug(f"Quality gate: score {score:.3f} < {min_score}")
         return False
 
     bbox = face.bbox.astype(int).tolist()
     width = int(bbox[2] - bbox[0])
-    if width < MIN_FACE_SIZE:
-        logger.debug(f"Quality gate: width {width} < {MIN_FACE_SIZE}")
+    min_size = EMBED_MIN_FACE_SIZE if strict else MIN_FACE_SIZE
+    if width < min_size:
+        logger.debug(f"Quality gate: width {width} < {min_size}")
+        return False
+
+    if MAX_FACE_SIZE > 0 and width > MAX_FACE_SIZE:
+        logger.debug(f"Quality gate: width {width} > MAX_FACE_SIZE {MAX_FACE_SIZE}")
         return False
 
     return True
@@ -829,7 +870,7 @@ async def get_embedding(
             return {"descriptor": None, "error": "No face detected", "quality": None, "issues": ["Лицо не обнаружено"]}
 
         face = faces[0]
-        if not passes_quality_gate(face):
+        if not passes_quality_gate(face, strict=strict):
             return {"descriptor": None, "error": "Low quality face", "quality": None, "issues": ["Низкое качество детекции лица"]}
 
         face_count = len(faces)
@@ -872,6 +913,11 @@ async def recognize(
     category: Optional[str] = "",
     threshold: Optional[float] = None,
     apply_cooldown: Optional[bool] = True,
+    passage_roi_x_min: Optional[float] = None,
+    passage_roi_x_max: Optional[float] = None,
+    passage_roi_y_min: Optional[float] = None,
+    passage_roi_y_max: Optional[float] = None,
+    guard_ignore_x_max: Optional[float] = None,
 ):
     """
     Full recognition pipeline.
@@ -906,7 +952,31 @@ async def recognize(
         if not valid_faces:
             return {"matches": [], "status": "no_valid_faces"}
 
-        primary_face = valid_faces[0]
+        # Zone filter: prefer faces inside passage ROI and outside guard ignore zone
+        roi_x_min = passage_roi_x_min if passage_roi_x_min is not None else PASSAGE_ROI["x_min"]
+        roi_x_max = passage_roi_x_max if passage_roi_x_max is not None else PASSAGE_ROI["x_max"]
+        roi_y_min = passage_roi_y_min if passage_roi_y_min is not None else PASSAGE_ROI["y_min"]
+        roi_y_max = passage_roi_y_max if passage_roi_y_max is not None else PASSAGE_ROI["y_max"]
+        guard_x_max = guard_ignore_x_max if guard_ignore_x_max is not None else GUARD_IGNORE_ZONE["x_max"]
+
+        def in_passage(bbox):
+            x1, y1, x2, y2 = [int(v) for v in bbox[:4]]
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            nx = cx / max(1, width)
+            ny = cy / max(1, height)
+            return (roi_x_min <= nx <= roi_x_max) and (roi_y_min <= ny <= roi_y_max)
+
+        def in_guard_zone(bbox):
+            x1, y1, x2, y2 = [int(v) for v in bbox[:4]]
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            nx = cx / max(1, width)
+            ny = cy / max(1, height)
+            return nx <= guard_x_max
+
+        zoned_faces = [f for f in valid_faces if in_passage(f.bbox) and not in_guard_zone(f.bbox)]
+        primary_face = zoned_faces[0] if zoned_faces else valid_faces[0]
         if not hasattr(primary_face, "embedding") or primary_face.embedding is None:
             return {"matches": [], "status": "no_embedding"}
 
