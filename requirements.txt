@@ -2,10 +2,7 @@ fastapi==0.139.2
 uvicorn==0.51.0
 python-multipart==0.0.32
 insightface==1.0.1
-# Для CNN GPU NVIDIA используйте onnxruntime-gpu:
-onnxruntime-gpu==1.20.1
-# Для AMD/Intel GPU на Windows используйте:
-# onnxruntime-directml==1.20.1
+onnxruntime==1.20.1
 numpy==1.26.4
 ml_dtypes==0.5.4
 opencv-python-headless==4.11.0.86

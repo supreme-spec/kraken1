@@ -25,16 +25,12 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Header
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
-from dotenv import load_dotenv
-
-load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 FRAME_SKIP: int = int(os.getenv("FACE_FRAME_SKIP", "2"))
 # Пороги для ЖИВОЙ детекции (умеренные — баланс между полнотой и ложными срабатываниями)
 MIN_FACE_SIZE: int = int(os.getenv("FACE_MIN_FACE_SIZE", "40"))
-MAX_FACE_SIZE: int = int(os.getenv("FACE_MAX_FACE_SIZE", "0"))
 MIN_DETECTION_SCORE: float = float(os.getenv("FACE_MIN_DET_SCORE", "0.6"))
 COOLDOWN_SECONDS: int = int(os.getenv("FACE_COOLDOWN_SECONDS", "30"))
 # .env хранит пороги в процентах (0-100), см. .env.example.
@@ -65,38 +61,6 @@ BRIGHTNESS_TO_LUX: float = float(os.getenv("FACE_BRIGHTNESS_TO_LUX", "0.8"))
 ENABLE_PREPROCESS: bool = os.getenv("FACE_ENABLE_PREPROCESS", "1") not in ("0", "false", "False")
 API_KEY: str = os.getenv("FACE_API_KEY", "")
 DB_PATH: str = os.getenv("DB_PATH", "prisma/dev.db")
-
-# ─── Zone filters (fraction of frame width/height) ─────────────────────────────
-# Passage ROI where the guest should appear.
-PASSAGE_ROI = {
-    "x_min": 0.30,
-    "x_max": 0.65,
-    "y_min": 0.10,
-    "y_max": 0.80,
-}
-# Left-side ignore zone where the guard stands.
-GUARD_IGNORE_ZONE = {
-    "x_min": 0.00,
-    "x_max": 0.30,
-    "y_min": 0.00,
-    "y_max": 1.00,
-}
-
-def is_valid_face_position(face_bbox, frame_width: int, frame_height: int) -> bool:
-    x1, y1, x2, y2 = [int(v) for v in face_bbox[:4]]
-    cx = (x1 + x2) / 2.0
-    cy = (y1 + y2) / 2.0
-    nx = cx / max(1, frame_width)
-    ny = cy / max(1, frame_height)
-    in_passage = (
-        PASSAGE_ROI["x_min"] <= nx <= PASSAGE_ROI["x_max"]
-        and PASSAGE_ROI["y_min"] <= ny <= PASSAGE_ROI["y_max"]
-    )
-    in_guard = (
-        GUARD_IGNORE_ZONE["x_min"] <= nx <= GUARD_IGNORE_ZONE["x_max"]
-        and GUARD_IGNORE_ZONE["y_min"] <= ny <= GUARD_IGNORE_ZONE["y_max"]
-    )
-    return in_passage and not in_guard
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -148,69 +112,22 @@ def verify_api_key(x_api_key: str = Header(None, alias="X-API-Key")):
 
 # ─── GPU Provider Selection ───────────────────────────────────────────────────
 
-
-class _SuppressStderr:
-    def __enter__(self):
-        self._original_stderr = None
-        try:
-            import sys
-
-            self._original_stderr = sys.stderr
-            sys.stderr = open(os.devnull, "w")
-        except Exception:
-            pass
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        try:
-            import sys
-
-            if self._original_stderr is not None:
-                sys.stderr = self._original_stderr
-        except Exception:
-            pass
-
-
-def _suppress_onnx_logs() -> None:
-    try:
-        import onnxruntime as _ort
-
-        _ort.set_default_logger_severity(4)
-    except Exception:
-        pass
-
-
-def _verify_provider(provider: str) -> bool:
-    """Quick sanity check that ONNX Runtime provider can be initialized."""
-    if provider == "CPUExecutionProvider":
-        return True
-    _suppress_onnx_logs()
-    try:
-        import onnxruntime as ort
-
-        return provider in ort.get_available_providers()
-    except Exception:
-        return False
-
-
 def get_optimal_providers() -> List[str]:
     """Determines best available GPU acceleration."""
-    _suppress_onnx_logs()
     import onnxruntime as ort
-
     available_providers = ort.get_available_providers()
     providers: List[str] = []
 
-    if "CUDAExecutionProvider" in available_providers and _verify_provider("CUDAExecutionProvider"):
+    if "CUDAExecutionProvider" in available_providers:
         providers.append("CUDAExecutionProvider")
         logger.info("NVIDIA GPU detected. Using CUDA.")
-    elif "DmlExecutionProvider" in available_providers and _verify_provider("DmlExecutionProvider"):
+    elif "DmlExecutionProvider" in available_providers:
         providers.append("DmlExecutionProvider")
         logger.info("AMD/Intel GPU detected. Using DirectML.")
-    elif "OpenVINOExecutionProvider" in available_providers and _verify_provider("OpenVINOExecutionProvider"):
+    elif "OpenVINOExecutionProvider" in available_providers:
         providers.append("OpenVINOExecutionProvider")
         logger.info("Intel GPU/CPU detected. Using OpenVINO.")
-    elif "ROCMExecutionProvider" in available_providers and _verify_provider("ROCMExecutionProvider"):
+    elif "ROCMExecutionProvider" in available_providers:
         providers.append("ROCMExecutionProvider")
         logger.info("AMD GPU detected. Using ROCm.")
     else:
@@ -226,58 +143,45 @@ def initialize_face_engine() -> Tuple[Any, str]:
     """Initializes InsightFace with smart fallback."""
     used_provider_local = "CPUExecutionProvider"
     try:
-        with _SuppressStderr():
-            return _initialize_face_engine_impl()
+        import insightface
+        import onnxruntime as ort
+        target_providers = get_optimal_providers()
+        ort.set_default_logger_severity(3)
+
+        if target_providers == ["CPUExecutionProvider"]:
+            logger.info("Initializing InsightFace on CPU...")
+            app_instance = insightface.app.FaceAnalysis(
+                name="buffalo_l", root=str(MODELS_DIR), providers=["CPUExecutionProvider"]
+            )
+            app_instance.prepare(ctx_id=-1, det_size=(640, 640))
+            logger.info("InsightFace loaded on CPU.")
+            return app_instance, "CPUExecutionProvider"
+
+        try:
+            logger.info(f"Attempting GPU initialization with: {target_providers[:-1]}")
+            app_instance = insightface.app.FaceAnalysis(
+                name="buffalo_l", root=str(MODELS_DIR), providers=target_providers
+            )
+            app_instance.prepare(ctx_id=0, det_size=(640, 640))
+            used_provider_local = target_providers[0]
+            logger.info(f"InsightFace loaded on {used_provider_local}.")
+            return app_instance, used_provider_local
+        except Exception as e:
+            logger.error(f"GPU initialization failed: {e}")
+            logger.warning("Falling back to CPU...")
+            app_instance = insightface.app.FaceAnalysis(
+                name="buffalo_l", root=str(MODELS_DIR), providers=["CPUExecutionProvider"]
+            )
+            app_instance.prepare(ctx_id=-1, det_size=(640, 640))
+            logger.info("InsightFace loaded on CPU (compatibility mode).")
+            return app_instance, "CPUExecutionProvider"
+
     except Exception as e:
         logger.error(f"Fatal initialization error: {e}")
         import traceback
         traceback.print_exc()
         logger.error("Running in demo mode (no AI).")
         return None, "none"
-
-
-def _initialize_face_engine_impl() -> Tuple[Any, str]:
-    used_provider_local = "CPUExecutionProvider"
-    import insightface
-    import onnxruntime as ort
-    target_providers = get_optimal_providers()
-    _suppress_onnx_logs()
-
-    if target_providers == ["CPUExecutionProvider"] or not _verify_provider(target_providers[0]):
-        logger.info("Initializing InsightFace on CPU...")
-        app_instance = insightface.app.FaceAnalysis(
-            name="buffalo_l", root=str(MODELS_DIR), providers=["CPUExecutionProvider"]
-        )
-        app_instance.prepare(ctx_id=-1, det_size=(640, 640))
-        logger.info("InsightFace loaded on CPU.")
-        return app_instance, "CPUExecutionProvider"
-
-    try:
-        logger.info(f"Attempting GPU initialization with: {target_providers[:-1]}")
-        app_instance = insightface.app.FaceAnalysis(
-            name="buffalo_l", root=str(MODELS_DIR), providers=target_providers
-        )
-        app_instance.prepare(ctx_id=0, det_size=(640, 640))
-
-        try:
-            first_model = next(iter(app_instance.models.values()))
-            actual_providers = getattr(getattr(first_model, "session", None), "get_providers", lambda: [])()
-            actual = actual_providers[0] if actual_providers else target_providers[0]
-        except Exception:
-            actual = target_providers[0]
-
-        used_provider_local = actual
-        logger.info(f"InsightFace loaded on {used_provider_local}.")
-        return app_instance, used_provider_local
-    except Exception as e:
-        logger.error(f"GPU initialization failed: {e}")
-        logger.warning("Falling back to CPU...")
-        app_instance = insightface.app.FaceAnalysis(
-            name="buffalo_l", root=str(MODELS_DIR), providers=["CPUExecutionProvider"]
-        )
-        app_instance.prepare(ctx_id=-1, det_size=(640, 640))
-        logger.info("InsightFace loaded on CPU (compatibility mode).")
-        return app_instance, "CPUExecutionProvider"
 
 
 # ─── Startup ──────────────────────────────────────────────────────────────────
@@ -410,7 +314,17 @@ def load_descriptors_from_sqlite(db_path: str = DB_PATH) -> List[Dict[str, Any]]
         logger.error(f"Failed to load descriptors from SQLite: {e}")
         return []
 
-# ─── Startup Auto-Index (загружается внутри initialize_face_engine) ───
+# ─── Startup Auto-Index (✅ ТЕПЕРЬ 100% БЕЗОПАСНО: вызов ПОСЛЕ объявления) ───
+
+if is_initialized:
+    try:
+        initial_descriptors = load_descriptors_from_sqlite()
+        if initial_descriptors:
+            _build_faiss_index(initial_descriptors)  # ✅ ТЕПЕРЬ ЭТО РАБОТАЕТ!
+        else:
+            logger.info("No descriptors found in DB. FAISS index is empty.")
+    except Exception as e:
+        logger.error(f"Auto-index build failed: {e}")
 
 
 # ─── Image Helpers ────────────────────────────────────────────────────────────
@@ -438,7 +352,6 @@ def passes_quality_gate(face: Any) -> bool:
     Rejects:
       - det_score < MIN_DETECTION_SCORE
       - face width < MIN_FACE_SIZE
-      - face width > MAX_FACE_SIZE (when enabled)
     """
     score = float(face.det_score) if hasattr(face, "det_score") else 0.0
     if score < MIN_DETECTION_SCORE:
@@ -451,10 +364,6 @@ def passes_quality_gate(face: Any) -> bool:
         logger.debug(f"Quality gate: width {width} < {MIN_FACE_SIZE}")
         return False
 
-    if MAX_FACE_SIZE > 0 and width > MAX_FACE_SIZE:
-        logger.debug(f"Quality gate: width {width} > MAX_FACE_SIZE {MAX_FACE_SIZE}")
-        return False
-
     return True
 
 
@@ -465,10 +374,7 @@ def _crop_face_region(img: np.ndarray, bbox: np.ndarray, pad_ratio: float = 0.2)
     if img is None or img.size == 0:
         return None
     try:
-        bbox_list = bbox.astype(int).tolist()
-        if len(bbox_list) < 4:
-            return None
-        x1, y1, x2, y2 = bbox_list[:4]
+        x1, y1, x2, y2 = bbox.astype(int).tolist()[:4]
         w = max(1, x2 - x1)
         h = max(1, y2 - y1)
         pad = int(max(w, h) * pad_ratio)
@@ -690,7 +596,6 @@ async def get_status() -> Dict[str, Any]:
         "frame_skip": FRAME_SKIP,
         "min_det_score": MIN_DETECTION_SCORE,
         "min_face_size": MIN_FACE_SIZE,
-        "max_face_size": MAX_FACE_SIZE if MAX_FACE_SIZE > 0 else None,
         "cooldown_seconds": COOLDOWN_SECONDS,
         "recognition_threshold": RECOGNITION_THRESHOLD,
         "enroll_sharpness_min": ENROLL_SHARPNESS_SCORE_MIN,
@@ -768,7 +673,7 @@ async def detect_faces(
         logger.error(f"Detection error: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Internal server error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/assess-quality", dependencies=[Depends(verify_api_key)])
@@ -844,7 +749,7 @@ async def assess_quality(image: UploadFile = File(...)):
         logger.error(f"Quality assessment error: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Internal server error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/get-embedding", dependencies=[Depends(verify_api_key)])
@@ -909,7 +814,7 @@ async def get_embedding(
         logger.error(f"Embedding error: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Internal server error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/recognize", dependencies=[Depends(verify_api_key)])
@@ -945,27 +850,13 @@ async def recognize(
         if not valid_faces:
             return {"matches": [], "status": "no_valid_faces"}
 
-        h, w = img.shape[:2]
-        zoned_faces = [f for f in valid_faces if is_valid_face_position(f.bbox, w, h)]
-        primary_face = zoned_faces[0] if zoned_faces else valid_faces[0]
+        primary_face = valid_faces[0]
         if not hasattr(primary_face, "embedding") or primary_face.embedding is None:
             return {"matches": [], "status": "no_embedding"}
 
         embedding = np.array(primary_face.embedding, dtype=np.float32)
         candidates = get_faiss_matches(embedding, top_k=top_k)
         effective_threshold = threshold if threshold is not None else RECOGNITION_THRESHOLD
-
-        box = primary_face.bbox.astype(int).tolist()
-        face_crop = _crop_face_region(img, primary_face.bbox)
-        sharpness = estimate_sharpness(face_crop)
-        face_area = max(1, (int(box[2]) - int(box[0]))) * max(1, (int(box[3]) - int(box[1])))
-        quality_score = float(sharpness) * float(face_area)
-        face_bbox = {
-            "x": int(box[0]),
-            "y": int(box[1]),
-            "width": int(box[2]) - int(box[0]),
-            "height": int(box[3]) - int(box[1]),
-        }
 
         matches: List[Dict[str, Any]] = []
         needs_confirmation_data = None
@@ -978,15 +869,12 @@ async def recognize(
             if sim > best_sim:
                 best_sim = sim
 
+            # Не отбрасываем кандидата с ВЫСОКИМ сходством из-за несовпадения
+            # категории: такой кандидат должен попасть к оператору на подтверждение
+            # (серая зона / авто-распознавание), а не молча уходить в unknown.
             if category and person.get("category") != category:
-                if sim >= LOW_THRESHOLD:
-                    needs_confirmation_data = {
-                        "person_id": person["person_id"],
-                        "person_name": person["person_name"],
-                        "similarity": sim,
-                        "photo_path": person.get("photo_path", ""),
-                    }
-                continue
+                if sim < LOW_THRESHOLD:
+                    continue
 
             if LOW_THRESHOLD <= sim < CONFIRMATION_THRESHOLD:
                 needs_confirmation_data = {
@@ -1019,9 +907,6 @@ async def recognize(
             "status": "ok" if matches else ("needs_confirmation" if needs_confirmation_data else "unknown"),
             "total_vectors": faiss_index.ntotal if faiss_index is not None else 0,
             "best_similarity": best_sim,
-            "face_bbox": face_bbox,
-            "sharpness": sharpness,
-            "quality_score": quality_score,
         }
 
         if needs_confirmation_data and not matches:
@@ -1034,7 +919,7 @@ async def recognize(
         logger.error(f"Recognition error: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Internal server error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/recognize-by-descriptor", dependencies=[Depends(verify_api_key)])
@@ -1080,15 +965,12 @@ async def recognize_by_descriptor(
             if sim > best_sim:
                 best_sim = sim
 
+            # Не отбрасываем кандидата с ВЫСОКИМ сходством из-за несовпадения
+            # категории: такой кандидат должен попасть к оператору на подтверждение
+            # (серая зона / авто-распознавание), а не молча уходить в unknown.
             if category and person.get("category") != category:
-                if sim >= LOW_THRESHOLD:
-                    needs_confirmation_data = {
-                        "person_id": person["person_id"],
-                        "person_name": person["person_name"],
-                        "similarity": sim,
-                        "photo_path": person.get("photo_path", ""),
-                    }
-                continue
+                if sim < LOW_THRESHOLD:
+                    continue
 
             if LOW_THRESHOLD <= sim < CONFIRMATION_THRESHOLD:
                 needs_confirmation_data = {
@@ -1133,7 +1015,7 @@ async def recognize_by_descriptor(
         logger.error(f"Descriptor recognition error: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Internal server error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/update-index", dependencies=[Depends(verify_api_key)])
@@ -1157,7 +1039,7 @@ async def update_index(payload: Dict[str, Any]):
         logger.error(f"Index update error: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Internal server error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/compare-faces", dependencies=[Depends(verify_api_key)])
@@ -1178,18 +1060,8 @@ async def compare_faces(
         logger.error(f"Comparison error: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Internal server error")
+        raise HTTPException(status_code=500, detail=str(e))
 
-
-# ─── Загрузка дескрипторов при старте (после всех определений функций) ───
-try:
-    initial_descriptors = load_descriptors_from_sqlite()
-    if initial_descriptors:
-        _build_faiss_index(initial_descriptors)
-    else:
-        logger.info("No descriptors found in DB. FAISS index is empty.")
-except Exception as e:
-    logger.error(f"Auto-index build failed: {e}")
 
 # ─── Entrypoint ───────────────────────────────────────────────────────────────
 
