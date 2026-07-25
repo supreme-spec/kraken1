@@ -411,12 +411,16 @@ export default function LiveMonitor({
   }, [search])
 
   useEffect(() => {
-    const saved = sessionStorage.getItem('kraken_people_drawer_open')
-    if (saved === 'true') setShowPeopleDrawer(true)
+    try {
+      const saved = sessionStorage.getItem('kraken_people_drawer_open')
+      if (saved === 'true') setShowPeopleDrawer(true)
+    } catch {}
   }, [])
 
   useEffect(() => {
-    sessionStorage.setItem('kraken_people_drawer_open', String(showPeopleDrawer))
+    try {
+      sessionStorage.setItem('kraken_people_drawer_open', String(showPeopleDrawer))
+    } catch {}
   }, [showPeopleDrawer])
 
   const fetchPeople = useCallback(async () => {
