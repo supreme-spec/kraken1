@@ -402,6 +402,7 @@ export default function LiveMonitor({
   const [showAddModal, setShowAddModal] = useState(false)
   const [guestInitialPhotos, setGuestInitialPhotos] = useState<File[]>([])
   const [editPerson, setEditPerson] = useState<Person | null>(null)
+  const [showPeopleDrawer, setShowPeopleDrawer] = useState(false)
 
   const fetchPeople = useCallback(async () => {
     setLoadingPeople(true)
@@ -693,95 +694,31 @@ export default function LiveMonitor({
           </DraggableBlock>
         )}
 
-        {/* База людей */}
+        {/* База людей — компактный вид */}
         {layout.people.visible && (
           <DraggableBlock id="people" state={layout.people} containerRef={containerRef}
-            onRectChange={updateRect} onFocus={bringToFront} title="База людей"
-            headerExtra={
-              <>
-                <div className="relative flex-1 max-w-[180px]">
-                  <Search size={11} className="absolute left-2 top-1/2 -translate-y-1/2 text-kraken-muted" />
+            onRectChange={updateRect} onFocus={bringToFront} title="База людей">
+            <div className="h-full flex flex-col items-center justify-center gap-3 p-4">
+              <div className="text-center">
+                <div className="text-3xl font-black text-kraken-text">{people.length}</div>
+                <div className="text-kraken-muted text-[10px] uppercase tracking-widest mt-1">персон в базе</div>
+              </div>
+              <div className="flex items-center gap-2 w-full">
+                <div className="relative flex-1">
+                  <Search size={12} className="absolute left-2 top-1/2 -translate-y-1/2 text-kraken-muted" />
                   <input type="text" placeholder="Поиск..." value={search}
                     onChange={e => setSearch(e.target.value)}
-                    className="w-full bg-kraken-base border border-kraken-border text-kraken-text text-xs pl-6 pr-2 py-1 rounded-lg focus:outline-none focus:border-kraken-purple" />
+                    className="w-full bg-kraken-hover border border-kraken-border text-kraken-text text-xs pl-6 pr-2 py-1.5 rounded-lg focus:outline-none focus:border-kraken-purple" />
                 </div>
-                <button onClick={() => { setEditPerson(null); setShowAddModal(true) }}
-                  className="flex items-center gap-1 bg-kraken-purple hover:bg-kraken-purple-hover text-white text-xs px-2 py-1 rounded-lg font-semibold transition-colors flex-shrink-0">
-                  <Plus size={11} /> Добавить
+                <button onClick={() => setShowPeopleDrawer(true)}
+                  className="flex items-center gap-1 bg-kraken-purple hover:bg-kraken-purple-hover text-white text-xs px-3 py-1.5 rounded-lg font-semibold transition-colors flex-shrink-0">
+                  <FolderOpen size={12} /> Открыть
                 </button>
-              </>
-            }>
-            <div className="h-full flex flex-col overflow-hidden">
-              <div className="flex-1 overflow-y-auto">
-                <table className="w-full">
-                  <thead className="sticky top-0 bg-kraken-panel z-10">
-                    <tr className="text-kraken-disabled text-[10px] uppercase tracking-wider border-b border-kraken-border">
-                      <th className="px-3 py-1.5 text-left">Фото</th>
-                      <th className="px-3 py-1.5 text-left">Имя</th>
-                      <th className="px-3 py-1.5 text-left">Категория</th>
-                      <th className="px-3 py-1.5 text-left">Комментарий</th>
-                      <th className="px-3 py-1.5 text-right">Действия</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {loadingPeople && (
-                      <tr><td colSpan={5} className="text-center py-4 text-kraken-disabled text-xs">Загрузка...</td></tr>
-                    )}
-                    {!loadingPeople && people.length === 0 && (
-                      <tr><td colSpan={5} className="text-center py-6">
-                        <div className="text-kraken-disabled text-sm mb-1">База пуста</div>
-                        <button onClick={() => { setEditPerson(null); setShowAddModal(true) }}
-                          className="text-kraken-purple text-xs hover:underline">+ Добавить</button>
-                      </td></tr>
-                    )}
-                    {people.map(p => (
-                      <tr key={p.id} className="border-b border-kraken-border hover:bg-kraken-hover transition-colors">
-                        <td className="px-3 py-1.5">
-                          <div className="w-16 h-16 rounded-lg overflow-hidden bg-kraken-hover border border-kraken-border">
-                            {p.photo_path
-                              ? <img src={`${PHOTO_BASE}/${p.photo_path}`} alt="" className="w-full h-full object-cover" />
-                              : <div className="w-full h-full flex items-center justify-center text-lg">👤</div>}
-                          </div>
-                        </td>
-                        <td className="px-3 py-1.5 text-kraken-text text-sm font-medium">{p.name}</td>
-                        <td className="px-3 py-1.5"><CategoryBadge category={p.category} /></td>
-                        <td className="px-3 py-1.5 text-kraken-muted text-sm max-w-[120px] truncate">{p.comment ?? '—'}</td>
-                        <td className="px-3 py-1.5">
-                          <div className="flex items-center gap-1 justify-end">
-                            <button onClick={() => { setEditPerson(p); setShowAddModal(true) }}
-                              className="p-1 rounded hover:bg-kraken-hover text-kraken-muted hover:text-kraken-purple transition-colors"
-                              title="Редактировать">
-                              <Edit2 size={14} />
-                            </button>
-                            {selectedCameraId && (
-                              <button
-                                onClick={() => handleAddPhotoFromCamera(p.id, selectedCameraId)}
-                                className="p-1 rounded hover:bg-kraken-hover text-kraken-muted hover:text-kraken-green transition-colors"
-                                title="Обновить фото с текущей камеры"
-                              >
-                                <ImagePlus size={14} />
-                              </button>
-                            )}
-                            <button onClick={() => handleDelete(p.id)}
-                              className="p-1 rounded hover:bg-kraken-hover text-kraken-muted hover:text-kraken-red transition-colors"
-                              title="Удалить">
-                              <Trash2 size={14} />
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
               </div>
-              <div className="px-3 py-1.5 border-t border-kraken-border flex items-center justify-between flex-shrink-0">
-                <span className="text-kraken-disabled text-[10px]">Всего: {people.length}</span>
-                {onNavigatePeople && (
-                  <button onClick={onNavigatePeople} className="text-kraken-purple text-[10px] hover:underline">
-                    Полная база →
-                  </button>
-                )}
-              </div>
+              <button onClick={() => { setEditPerson(null); setShowAddModal(true) }}
+                className="flex items-center gap-1 text-kraken-purple text-xs hover:underline mt-1">
+                <Plus size={12} /> Добавить персону
+              </button>
             </div>
           </DraggableBlock>
         )}
@@ -854,6 +791,86 @@ export default function LiveMonitor({
           message={alertState.message}
           onClose={() => setAlertState(null)}
         />
+      )}
+
+      {/* ── База людей: drawer 50% справа ── */}
+      {showPeopleDrawer && (
+        <div className="fixed inset-0 z-50 flex">
+          <div className="absolute inset-0 bg-black/60" onClick={() => setShowPeopleDrawer(false)} />
+          <div className="relative ml-auto w-full max-w-[50vw] h-full bg-kraken-panel border-l border-kraken-border shadow-2xl animate-fade-in overflow-hidden flex flex-col">
+            <div className="flex items-center justify-between p-4 border-b border-kraken-border flex-shrink-0">
+              <div>
+                <div className="text-kraken-text text-sm font-semibold">База людей</div>
+                <div className="text-kraken-disabled text-[10px]">{people.length} персон</div>
+              </div>
+              <button onClick={() => setShowPeopleDrawer(false)} className="text-kraken-muted hover:text-kraken-text">
+                <X size={18} />
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto">
+              <table className="w-full">
+                <thead className="sticky top-0 bg-kraken-panel z-10">
+                  <tr className="text-kraken-disabled text-[10px] uppercase tracking-wider border-b border-kraken-border">
+                    <th className="px-4 py-2 text-left">Фото</th>
+                    <th className="px-4 py-2 text-left">Имя</th>
+                    <th className="px-4 py-2 text-left">Категория</th>
+                    <th className="px-4 py-2 text-left">Комментарий</th>
+                    <th className="px-4 py-2 text-right">Действия</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {loadingPeople && (
+                    <tr><td colSpan={5} className="text-center py-8 text-kraken-disabled text-xs">Загрузка...</td></tr>
+                  )}
+                  {!loadingPeople && people.length === 0 && (
+                    <tr><td colSpan={5} className="text-center py-8">
+                      <div className="text-kraken-disabled text-sm mb-2">База пуста</div>
+                      <button onClick={() => { setEditPerson(null); setShowAddModal(true); setShowPeopleDrawer(false) }}
+                        className="text-kraken-purple text-xs hover:underline">+ Добавить</button>
+                    </td></tr>
+                  )}
+                  {people.map(p => (
+                    <tr key={p.id} className="border-b border-kraken-border hover:bg-kraken-hover transition-colors">
+                      <td className="px-4 py-2">
+                        <div className="w-12 h-12 rounded-lg overflow-hidden bg-kraken-hover border border-kraken-border">
+                          {p.photo_path
+                            ? <img src={`${PHOTO_BASE}/${p.photo_path}`} alt="" className="w-full h-full object-cover" />
+                            : <div className="w-full h-full flex items-center justify-center text-lg">👤</div>}
+                        </div>
+                      </td>
+                      <td className="px-4 py-2 text-kraken-text text-sm font-medium">{p.name}</td>
+                      <td className="px-4 py-2"><CategoryBadge category={p.category} /></td>
+                      <td className="px-4 py-2 text-kraken-muted text-sm max-w-[200px] truncate">{p.comment ?? '—'}</td>
+                      <td className="px-4 py-2">
+                        <div className="flex items-center gap-1 justify-end">
+                          <button onClick={() => { setEditPerson(p); setShowAddModal(true) }}
+                            className="p-1.5 rounded hover:bg-kraken-hover text-kraken-muted hover:text-kraken-purple transition-colors"
+                            title="Редактировать">
+                            <Edit2 size={14} />
+                          </button>
+                          {selectedCameraId && (
+                            <button
+                              onClick={() => handleAddPhotoFromCamera(p.id, selectedCameraId)}
+                              className="p-1.5 rounded hover:bg-kraken-hover text-kraken-muted hover:text-kraken-green transition-colors"
+                              title="Обновить фото"
+                            >
+                              <ImagePlus size={14} />
+                            </button>
+                          )}
+                          <button onClick={() => handleDelete(p.id)}
+                            className="p-1.5 rounded hover:bg-kraken-hover text-kraken-muted hover:text-kraken-red transition-colors"
+                            title="Удалить">
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   )
