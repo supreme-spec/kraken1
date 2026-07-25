@@ -91,6 +91,13 @@ let pythonServerCheckPromise: Promise<boolean> | null = null;
 /** Таймер периодического health check */
 let healthCheckTimer: ReturnType<typeof setInterval> | null = null;
 
+/** FAISS sync status */
+let faissSyncStatus: 'SYNCED' | 'DIRTY' | 'SYNCING' = 'SYNCED';
+let faissSyncRetryCount = 0;
+const FAISS_SYNC_MAX_RETRIES = 5;
+const FAISS_SYNC_BASE_DELAY_MS = 30_000;
+let faissSyncRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
 // ─── Circuit Breaker State ────────────────────────────────────────────────────
 
 type CircuitState = "closed" | "open" | "half-open";
@@ -883,6 +890,9 @@ async function recognizeDescriptorOnServer(
 }
 
 async function syncIndexWithPython(): Promise<void> {
+  if (faissSyncStatus === 'SYNCING') return;
+
+  faissSyncStatus = 'SYNCING';
   try {
     const persons = storedDescriptors.map((d) => ({
       person_id: d.personId,
@@ -899,14 +909,36 @@ async function syncIndexWithPython(): Promise<void> {
     });
 
     if (!response.ok) {
-      logWarn(`Python index sync failed: ${response.status}`);
-    } else {
-      const result = await response.json() as { indexed?: number };
-      logDebug(`FAISS index synced with Python: ${result.indexed ?? "?"} vectors`);
+      throw new Error(`FAISS sync failed: ${response.status}`);
     }
+
+    const result = await response.json() as { indexed?: number };
+    logDebug(`FAISS index synced with Python: ${result.indexed ?? "?"} vectors`);
+    faissSyncStatus = 'SYNCED';
+    faissSyncRetryCount = 0;
   } catch (e) {
     logError(e as Error, { context: "Синхронизация индекса с Python" });
+    faissSyncStatus = 'DIRTY';
+    scheduleFaissSyncRetry();
   }
+}
+
+function scheduleFaissSyncRetry() {
+  if (faissSyncRetryTimer) clearTimeout(faissSyncRetryTimer);
+  if (faissSyncRetryCount >= FAISS_SYNC_MAX_RETRIES) {
+    logWarn(`FAISS sync max retries (${FAISS_SYNC_MAX_RETRIES}) reached. Manual intervention may be required.`);
+    return;
+  }
+  faissSyncRetryCount++;
+  const delay = FAISS_SYNC_BASE_DELAY_MS * Math.pow(2, faissSyncRetryCount - 1);
+  logWarn(`FAISS sync scheduled retry #${faissSyncRetryCount} in ${delay}ms`);
+  faissSyncRetryTimer = setTimeout(async () => {
+    await syncIndexWithPython();
+  }, delay);
+}
+
+export function getFaissSyncStatus(): { status: string; retryCount: number } {
+  return { status: faissSyncStatus, retryCount: faissSyncRetryCount };
 }
 
 // ─── ОСНОВНЫЕ ФУНКЦИИ ────────────────────────────────────────────────────────

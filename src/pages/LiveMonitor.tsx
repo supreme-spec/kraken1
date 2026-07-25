@@ -398,22 +398,37 @@ export default function LiveMonitor({
   // People
   const [people, setPeople] = useState<Person[]>([])
   const [search, setSearch] = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
   const [loadingPeople, setLoadingPeople] = useState(false)
   const [showAddModal, setShowAddModal] = useState(false)
   const [guestInitialPhotos, setGuestInitialPhotos] = useState<File[]>([])
   const [editPerson, setEditPerson] = useState<Person | null>(null)
   const [showPeopleDrawer, setShowPeopleDrawer] = useState(false)
 
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(search), 300)
+    return () => clearTimeout(t)
+  }, [search])
+
+  useEffect(() => {
+    const saved = sessionStorage.getItem('kraken_people_drawer_open')
+    if (saved === 'true') setShowPeopleDrawer(true)
+  }, [])
+
+  useEffect(() => {
+    sessionStorage.setItem('kraken_people_drawer_open', String(showPeopleDrawer))
+  }, [showPeopleDrawer])
+
   const fetchPeople = useCallback(async () => {
     setLoadingPeople(true)
     try {
       const params = new URLSearchParams()
-      if (search) params.set('search', search)
+      if (debouncedSearch) params.set('search', debouncedSearch)
       const data = await apiFetch<Person[]>(`/persons/?${params}`)
       setPeople(data)
     } catch {}
     finally { setLoadingPeople(false) }
-  }, [search])
+  }, [debouncedSearch])
 
   useEffect(() => { fetchPeople() }, [fetchPeople])
 

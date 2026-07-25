@@ -33,6 +33,8 @@ model Camera {
   username             String?
   password             String?
   use_camera_analytics Boolean   @default(false)
+  faiss_sync_status    String?   @default("SYNCED") // SYNCED | DIRTY | SYNCING
+  faiss_dirty_at       DateTime?
 
   passage_roi_x_min    Float?    @default(0.3)
   passage_roi_x_max    Float?    @default(0.65)

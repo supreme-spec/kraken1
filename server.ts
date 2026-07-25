@@ -1851,7 +1851,9 @@ app.delete(["/api/persons/:id/photos/:photoId", "/api/persons/:id/photos/:photoI
       const fullPath = path.join(photosDir, photoPath);
       if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
     } catch (e) {
-      logError(e as Error, { context: "delete-person-photo-file", path: photoPath });
+      if ((e as any).code !== 'ENOENT') {
+        logError(e as Error, { context: "delete-person-photo-file", path: photoPath });
+      }
     }
 
     if (wasPrimary) {
@@ -1902,32 +1904,48 @@ app.post(["/api/persons/:id/photos/:photoId/set_primary", "/api/persons/:id/phot
 // ── ORPHAN PHOTOS CLEANUP ──
 // Удаляет фото персон, у которых нет эмбеддингов (has_embedding = false).
 // Используется для очистки «мусорных» кадров, которые не прошли ворот качества.
+const ORPHAN_CLEANUP_MIN_AGE_MS = 60 * 60 * 1000; // 1 час
+const ORPHAN_CLEANUP_BATCH = 100;
+
 app.post("/api/persons/cleanup-orphan-photos", async (req, res) => {
   try {
+    const cutoff = new Date(Date.now() - ORPHAN_CLEANUP_MIN_AGE_MS);
     const orphans = await prisma.personPhoto.findMany({
-      where: { has_embedding: false },
+      where: {
+        has_embedding: false,
+        created_at: { lt: cutoff },
+      },
       include: { person: { select: { id: true, name: true } } },
     });
 
     let deletedFiles = 0;
     let deletedRecords = 0;
 
-    for (const photo of orphans) {
-      try {
-        const fullPath = path.join(photosDir, photo.photo_path);
-        if (fs.existsSync(fullPath)) {
-          fs.unlinkSync(fullPath);
-          deletedFiles++;
+    for (let i = 0; i < orphans.length; i += ORPHAN_CLEANUP_BATCH) {
+      const batch = orphans.slice(i, i + ORPHAN_CLEANUP_BATCH);
+      for (const photo of batch) {
+        try {
+          const fullPath = path.join(photosDir, photo.photo_path);
+          if (fs.existsSync(fullPath)) {
+            fs.unlinkSync(fullPath);
+            deletedFiles++;
+          }
+        } catch (e) {
+          if ((e as any).code !== 'ENOENT') {
+            logError(e as Error, { context: "delete-orphan-photo-file", path: photo.photo_path });
+          }
         }
-      } catch (e) {
-        logError(e as Error, { context: "delete-orphan-photo-file", path: photo.photo_path });
+
+        await prisma.personPhoto.delete({ where: { id: photo.id } });
+        deletedRecords++;
       }
 
-      await prisma.personPhoto.delete({ where: { id: photo.id } });
-      deletedRecords++;
+      if (i + ORPHAN_CLEANUP_BATCH < orphans.length) {
+        await new Promise(r => setTimeout(r, 50));
+      }
     }
 
-    logInfo(`Очистка фото без эмбеддингов: удалено файлов ${deletedFiles}, записей ${deletedRecords}`);
+    logInfo(`[OrphanCleanup] Удалено фото без эмбеддингов: ${deletedRecords} (файлов: ${deletedFiles})`);
 
     res.json({
       success: true,
