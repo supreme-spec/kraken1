@@ -1068,19 +1068,23 @@ function ExistingPhotos({ person, onDeleted }: { person: Person; onDeleted: () =
   } | null>(null)
 
   const handleDelete = (photoId: number) => {
+    const photo = localPhotos.find(p => p.id === photoId)
+    if (!photo) return
     setConfirmState({
       isOpen: true,
       title: 'Удалить фото',
-      message: 'Удалить это фото? Эмбеддинги будут пересозданы из оставшихся фото.',
+      message: 'Удалить это фото? Эмбеддинг будет удалён из распознавания.',
       isDamage: true,
       onConfirm: async () => {
         setConfirmState(null)
         setDeleting(photoId)
+        const backup = photo
+        setLocalPhotos(prev => prev.filter(p => p.id !== photoId))
         try {
           await apiFetch(`/persons/${person.id}/photos/${photoId}`, { method: 'DELETE' })
-          setLocalPhotos(prev => prev.filter(p => p.id !== photoId))
           onDeleted()
         } catch (e: any) {
+          setLocalPhotos(prev => [...prev, backup].sort((a, b) => a.id - b.id))
           setAlertState({ isOpen: true, title: 'Ошибка', message: 'Ошибка удаления: ' + e.message })
         } finally {
           setDeleting(null)

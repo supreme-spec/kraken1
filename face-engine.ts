@@ -1334,6 +1334,36 @@ export async function unregisterPerson(personId: number): Promise<void> {
 }
 
 /**
+ * Удаляет дескриптор(ы), связанные с конкретным фото.
+ * Используется при удалении фото персоны, чтобы не оставлять "мёртвых" эмбеддингов в FAISS.
+ */
+export async function removeDescriptorsByPhotoPath(
+  personId: number,
+  photoPath: string
+): Promise<number> {
+  const before = storedDescriptors.length;
+  let i = storedDescriptors.length;
+  while (i--) {
+    if (storedDescriptors[i].personId === personId && storedDescriptors[i].photoPath === photoPath) {
+      storedDescriptors.splice(i, 1);
+    }
+  }
+  const removed = before - storedDescriptors.length;
+  if (removed > 0) {
+    try {
+      await prisma.faceDescriptor.deleteMany({
+        where: { person_id: personId, photo_path: photoPath },
+      });
+    } catch (err) {
+      logError(err as Error, { context: "Удаление дескриптора фото из БД", personId, photoPath });
+    }
+    logDebug(`Удалено ${removed} дескрипторов для фото ${photoPath} персоны ID: ${personId}`);
+    await syncIndexWithPython();
+  }
+  return removed;
+}
+
+/**
  * Оптимизированный поиск по фото.
  *
  * Улучшения:

@@ -36,6 +36,7 @@ import {
   searchByDescriptor,
   addEmbeddingToPerson,
   getEmbeddingCountForPerson,
+  removeDescriptorsByPhotoPath,
 } from "./face-engine.js";
 import { prisma } from "./db.js";
 import logger, { logInfo, logError, logWarn, logDebug } from "./src/lib/logger.js";
@@ -1834,9 +1835,17 @@ app.delete(["/api/persons/:id/photos/:photoId", "/api/persons/:id/photos/:photoI
 
     const photo = await prisma.personPhoto.findUnique({ where: { id: photoId } });
     if (!photo) return res.status(404).json({ detail: "Photo not found" });
+    if (photo.person_id !== id) return res.status(400).json({ detail: "Photo does not belong to this person" });
 
     const photoPath = photo.photo_path;
+    const wasPrimary = photo.is_primary;
+    const hadEmbedding = photo.has_embedding;
+
     await prisma.personPhoto.delete({ where: { id: photoId } });
+
+    if (hadEmbedding) {
+      await removeDescriptorsByPhotoPath(id, photoPath);
+    }
 
     try {
       const fullPath = path.join(photosDir, photoPath);
@@ -1845,8 +1854,7 @@ app.delete(["/api/persons/:id/photos/:photoId", "/api/persons/:id/photos/:photoI
       logError(e as Error, { context: "delete-person-photo-file", path: photoPath });
     }
 
-    // Если удалили primary — назначаем первую оставшуюся
-    if (photo.is_primary) {
+    if (wasPrimary) {
       const remaining = await prisma.personPhoto.findFirst({ where: { person_id: id }, orderBy: { id: "asc" } });
       if (remaining) {
         await prisma.personPhoto.update({ where: { id: remaining.id }, data: { is_primary: true } });
@@ -1855,6 +1863,9 @@ app.delete(["/api/persons/:id/photos/:photoId", "/api/persons/:id/photos/:photoI
         await prisma.person.update({ where: { id }, data: { photo_path: null } });
       }
     }
+
+    const countNow = getEmbeddingCountForPerson(id);
+    await prisma.person.update({ where: { id }, data: { embedding_count: countNow } }).catch(() => {});
 
     const updated = await prisma.person.findUnique({ where: { id }, include: { photos: true } });
     const idx = persons.findIndex((p) => p.id === id);

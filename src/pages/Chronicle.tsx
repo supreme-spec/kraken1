@@ -189,18 +189,24 @@ export default function Chronicle() {
       onConfirm: async () => {
         setConfirmState(null)
         setDeletingPhoto(visitor.filename)
+        const backup = visitor
+        setDayData(prev => prev ? {
+          ...prev,
+          visitors: prev.visitors.filter(v => v.filename !== visitor.filename),
+          count: prev.count - 1,
+        } : null)
+        if (drawerVisitor?.filename === visitor.filename) setDrawerVisitor(null)
         try {
           await apiFetch(
             `/chronicle/camera/${activeCameraId}/day/${selectedDay.date}/photo/${encodeURIComponent(visitor.filename)}`,
             { method: 'DELETE' }
           )
+        } catch (e: any) {
           setDayData(prev => prev ? {
             ...prev,
-            visitors: prev.visitors.filter(v => v.filename !== visitor.filename),
-            count: prev.count - 1,
+            visitors: [backup, ...prev.visitors].sort((a, b) => b.filename.localeCompare(a.filename)),
+            count: prev.count + 1,
           } : null)
-          if (drawerVisitor?.filename === visitor.filename) setDrawerVisitor(null)
-        } catch (e: any) {
           setAlertState({ isOpen: true, title: 'Ошибка', message: 'Ошибка удаления: ' + e.message })
         } finally {
           setDeletingPhoto(null)
