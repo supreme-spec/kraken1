@@ -1899,6 +1899,48 @@ app.post(["/api/persons/:id/photos/:photoId/set_primary", "/api/persons/:id/phot
   }
 });
 
+// ── ORPHAN PHOTOS CLEANUP ──
+// Удаляет фото персон, у которых нет эмбеддингов (has_embedding = false).
+// Используется для очистки «мусорных» кадров, которые не прошли ворот качества.
+app.post("/api/persons/cleanup-orphan-photos", async (req, res) => {
+  try {
+    const orphans = await prisma.personPhoto.findMany({
+      where: { has_embedding: false },
+      include: { person: { select: { id: true, name: true } } },
+    });
+
+    let deletedFiles = 0;
+    let deletedRecords = 0;
+
+    for (const photo of orphans) {
+      try {
+        const fullPath = path.join(photosDir, photo.photo_path);
+        if (fs.existsSync(fullPath)) {
+          fs.unlinkSync(fullPath);
+          deletedFiles++;
+        }
+      } catch (e) {
+        logError(e as Error, { context: "delete-orphan-photo-file", path: photo.photo_path });
+      }
+
+      await prisma.personPhoto.delete({ where: { id: photo.id } });
+      deletedRecords++;
+    }
+
+    logInfo(`Очистка фото без эмбеддингов: удалено файлов ${deletedFiles}, записей ${deletedRecords}`);
+
+    res.json({
+      success: true,
+      deleted_files: deletedFiles,
+      deleted_records: deletedRecords,
+      message: `Удалено ${deletedRecords} фото без эмбеддингов (${deletedFiles} файлов)`,
+    });
+  } catch (err) {
+    logError(err as Error, { path: "/api/persons/cleanup-orphan-photos", method: "POST" });
+    res.status(500).json({ detail: "Internal server error" });
+  }
+});
+
 // ── FAILED EMBEDDINGS ──
 // Коллектор «мусорных» кадров, отклонённых воротами качества при ЗАПИСИ
 // референсного эмбеддинга (размытие / наклон головы / темнота / несколько лиц).
@@ -4664,6 +4706,39 @@ async function start() {
       }
     }
   }, 60000);
+
+  // Auto-cleanup orphan photos (no embeddings) — every 24 hours
+  setInterval(async () => {
+    try {
+      const orphans = await prisma.personPhoto.findMany({
+        where: { has_embedding: false },
+        include: { person: { select: { id: true, name: true } } },
+      });
+      if (orphans.length === 0) return;
+
+      let deletedFiles = 0;
+      let deletedRecords = 0;
+
+      for (const photo of orphans) {
+        try {
+          const fullPath = path.join(photosDir, photo.photo_path);
+          if (fs.existsSync(fullPath)) {
+            fs.unlinkSync(fullPath);
+            deletedFiles++;
+          }
+        } catch (e) {
+          logError(e as Error, { context: "auto-delete-orphan-photo-file", path: photo.photo_path });
+        }
+
+        await prisma.personPhoto.delete({ where: { id: photo.id } });
+        deletedRecords++;
+      }
+
+      logInfo(`[AutoCleanup] Удалено фото без эмбеддингов: ${deletedRecords} (файлов: ${deletedFiles})`);
+    } catch (e) {
+      logError(e as Error, { context: "auto-cleanup-orphan-photos" });
+    }
+  }, 24 * 60 * 60 * 1000);
 }
 
 start();

@@ -30,6 +30,8 @@ export default function People() {
   const [addPhotoPerson, setAddPhotoPerson] = useState<Person | null>(null)
   const [showPhotoSearch, setShowPhotoSearch] = useState(false)
   const [showBulkImport, setShowBulkImport] = useState(false)
+  const [cleaningOrphans, setCleaningOrphans] = useState(false)
+  const [orphanCleanupResult, setOrphanCleanupResult] = useState<string | null>(null)
 
   // Вкладки: База лиц (database) и Ошибки эмбеддингов (failed_embeddings)
   const [activeTab, setActiveTab] = useState<'database' | 'failed_embeddings'>('database')
@@ -164,6 +166,32 @@ export default function People() {
     })
   }
 
+  const handleCleanupOrphanPhotos = async () => {
+    setConfirmState({
+      isOpen: true,
+      title: 'Очистка фото без эмбеддингов',
+      message: 'Удалить все фото, которые не имеют эмбеддингов? Это действие необратимо.',
+      isDamage: true,
+      onConfirm: async () => {
+        setConfirmState(null)
+        setCleaningOrphans(true)
+        setOrphanCleanupResult(null)
+        try {
+          const res = await apiFetch<{ success: boolean; deleted_files: number; deleted_records: number; message: string }>(
+            '/persons/cleanup-orphan-photos',
+            { method: 'POST' }
+          )
+          setOrphanCleanupResult(res.message)
+          fetchPeople()
+        } catch (e: any) {
+          setAlertState({ isOpen: true, title: 'Ошибка', message: 'Ошибка очистки: ' + e.message })
+        } finally {
+          setCleaningOrphans(false)
+        }
+      }
+    })
+  }
+
   const toggleSort = (col: string) => {
     if (sortBy === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc')
     else { setSortBy(col); setSortDir('desc') }
@@ -239,7 +267,16 @@ export default function People() {
           <button onClick={() => setShowPhotoSearch(true)} className="btn-ghost flex items-center gap-1.5 text-sm py-2 px-3 flex-shrink-0 text-kraken-purple hover:text-kraken-purple border border-kraken-purple/30 hover:border-kraken-purple/60">
             <ScanFace size={14} /> Поиск по фото
           </button>
+          <button onClick={handleCleanupOrphanPhotos} disabled={cleaningOrphans} className="btn-ghost flex items-center gap-1.5 text-sm py-2 px-3 flex-shrink-0 text-amber-400 hover:text-amber-400 border border-amber-400/30 hover:border-amber-400/60 disabled:opacity-50" title="Удалить все фото без эмбеддингов">
+            <Trash2 size={14} /> {cleaningOrphans ? 'Очистка...' : 'Очистить фото'}
+          </button>
         </div>
+
+        {orphanCleanupResult && (
+          <div className="text-xs text-kraken-green bg-kraken-green/10 px-3 py-1.5 rounded-lg border border-kraken-green/30">
+            {orphanCleanupResult}
+          </div>
+        )}
 
         {/* ── Панель массовых действий ── */}
         {selected.size > 0 && (
