@@ -4087,12 +4087,16 @@ app.post(["/api/persons/reindex_all", "/api/persons/reindex_all/"], async (req, 
 
         let registered = 0;
         for (const photo of photos) {
-          const fullPath = path.join(publicDir, photo.photo_path);
-          if (!fs.existsSync(fullPath)) continue;
-          const result = await registerFacePerson(
-            person.id, person.name, person.category, photo.photo_path, fullPath
-          );
-          if (result.hasEmbedding) registered++;
+          try {
+            const fullPath = path.join(publicDir, photo.photo_path);
+            if (!fs.existsSync(fullPath)) continue;
+            const result = await registerFacePerson(
+              person.id, person.name, person.category, photo.photo_path, fullPath
+            );
+            if (result.hasEmbedding) registered++;
+          } catch (photoErr: any) {
+            logWarn(`reindex_all: фото "${photo.photo_path}" для "${person.name}" пропущено: ${photoErr?.message || photoErr}`);
+          }
         }
 
         const actualCount = getEmbeddingCountForPerson(person.id);
@@ -4614,6 +4618,14 @@ async function freePort(port: number): Promise<void> {
 }
 
 async function start() {
+  // Глобальный safety net: не даём серверу упасть из-за одного не пойманного промиса/ошибки
+  process.on('unhandledRejection', (reason: any) => {
+    logError(reason instanceof Error ? reason : new Error(String(reason)), { context: 'unhandledRejection' });
+  });
+  process.on('uncaughtException', (err: Error) => {
+    logError(err, { context: 'uncaughtException' });
+  });
+
   // Инициализация базы данных
   await seedDatabase();
 
