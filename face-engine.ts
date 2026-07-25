@@ -723,7 +723,28 @@ async function getEmbeddingFromServer(
     });
 
     if (!response.ok) {
-      throw new Error(`Server responded with status: ${response.status}`);
+      const status = response.status;
+      let serverMessage: string | undefined;
+      try {
+        const errJson = await response.json();
+        serverMessage = errJson?.error || errJson?.detail;
+      } catch {
+        serverMessage = undefined;
+      }
+      const msg = serverMessage || `HTTP ${status}`;
+
+      if (status === 400) {
+        logWarn(`Python rejected image: ${msg}`);
+        return {
+          descriptor: null,
+          quality: null,
+          issues: [msg],
+          passed: false,
+          error: msg,
+        };
+      }
+
+      throw new Error(`Face server error ${status}: ${msg}`);
     }
 
     const result = await response.json() as {
